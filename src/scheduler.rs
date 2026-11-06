@@ -123,13 +123,13 @@ impl<'a> Scheduler<'a> {
                 .context("rodata not mapped")?;
             rodata.nr_cpu_ids = nr_cpus as u64;
             rodata.uei_dump_len = EXIT_DUMP_LEN;
-            // EVERY sched_ext ENUM SHIM THE OBJECT CARRIES, FROM THE KERNEL'S
-            // OWN vmlinux.h. AN UNWRITTEN SHIM READS ZERO, WHICH IS A FLAG THAT
-            // NEVER FIRES OR A DSQ ID THAT NAMES THE WRONG QUEUE. THE LIST IS
-            // THE SKELETON'S LESS THE FIVE ENUMERATORS THIS KERNEL'S BTF DOES
-            // NOT DEFINE (SCX_RQ_BAL_PENDING, SCX_RQ_BAL_KEEP, SCX_RQ_BYPASSING,
-            // SCX_TASK_CURSOR, SCX_TASK_NR_STATES), WHICH THE PROGRAM NEVER
-            // READS. A SHIM ABSENT FROM EITHER SIDE FAILS THE BUILD.
+            // EVERY sched_ext ENUM SHIM THE OBJECT CARRIES, ALL FORTY-ONE THE
+            // VENDORED HEADER DECLARES, FROM THE KERNEL'S OWN vmlinux.h. ONE
+            // THE RUNNING KERNEL DOES NOT DEFINE IS ZERO, WRITTEN BY build.rs
+            // AND NAMED IN ITS WARNING: A FLAG THE KERNEL HAS NO BIT FOR NEVER
+            // FIRES. A SHIM THE SKELETON HAS AND THIS LIST LACKS WOULD READ
+            // ZERO UNSEEN, WHICH IS WHY THE LIST IS THE HEADER'S, NOT A
+            // KERNEL'S.
             rodata.__SCX_OPS_NAME_LEN = e::SCX_OPS_NAME_LEN;
             rodata.__SCX_SLICE_DFL = e::SCX_SLICE_DFL;
             rodata.__SCX_SLICE_INF = e::SCX_SLICE_INF;
@@ -138,6 +138,9 @@ impl<'a> Scheduler<'a> {
             rodata.__SCX_RQ_CLK_VALID = e::SCX_RQ_CLK_VALID;
             rodata.__SCX_RQ_IN_WAKEUP = e::SCX_RQ_IN_WAKEUP;
             rodata.__SCX_RQ_IN_BALANCE = e::SCX_RQ_IN_BALANCE;
+            rodata.__SCX_RQ_BAL_PENDING = e::SCX_RQ_BAL_PENDING;
+            rodata.__SCX_RQ_BAL_KEEP = e::SCX_RQ_BAL_KEEP;
+            rodata.__SCX_RQ_BYPASSING = e::SCX_RQ_BYPASSING;
             rodata.__SCX_DSQ_FLAG_BUILTIN = e::SCX_DSQ_FLAG_BUILTIN;
             rodata.__SCX_DSQ_FLAG_LOCAL_ON = e::SCX_DSQ_FLAG_LOCAL_ON;
             rodata.__SCX_DSQ_INVALID = e::SCX_DSQ_INVALID;
@@ -156,6 +159,8 @@ impl<'a> Scheduler<'a> {
             rodata.__SCX_TASK_READY = e::SCX_TASK_READY;
             rodata.__SCX_TASK_ENABLED = e::SCX_TASK_ENABLED;
             rodata.__SCX_TASK_DSQ_ON_PRIQ = e::SCX_TASK_DSQ_ON_PRIQ;
+            rodata.__SCX_TASK_CURSOR = e::SCX_TASK_CURSOR;
+            rodata.__SCX_TASK_NR_STATES = e::SCX_TASK_NR_STATES;
             rodata.__SCX_KICK_IDLE = e::SCX_KICK_IDLE;
             rodata.__SCX_KICK_PREEMPT = e::SCX_KICK_PREEMPT;
             rodata.__SCX_KICK_WAIT = e::SCX_KICK_WAIT;

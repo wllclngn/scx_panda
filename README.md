@@ -49,7 +49,9 @@ if the kernel asks it to.
 
 ## Requirements
 
-- Linux 6.12 or later, built with `CONFIG_SCHED_CLASS_EXT=y`
+- Linux 6.12 or later, built with `CONFIG_SCHED_CLASS_EXT=y`. A kernel that
+  lacks some of the newer sched_ext enumerators still builds; the build names
+  them in a warning and the loader writes them as zero.
 - clang 17 or later and Rust 1.91 or later, to build
 - bpftool, for the first build on each kernel
 

@@ -1724,16 +1724,15 @@ static __always_inline u64 effective_weight(const struct task_struct *p,
 static __always_inline void update_pair_ledger(struct task_ctx *tctx,
 					       s32 waker_pid)
 {
-	if (waker_pid > 0) {
-		if (tctx->last_waker_pid == waker_pid) {
-			if (tctx->same_waker_runs < PAIR_OBS_CAP)
-				tctx->same_waker_runs += 1;
-		} else {
-			tctx->last_waker_pid = waker_pid;
-			tctx->same_waker_runs = 0;
-		}
+	if (waker_pid <= 0)
+		return;
+	if (tctx->last_waker_pid == waker_pid) {
+		if (tctx->same_waker_runs < PAIR_OBS_CAP)
+			tctx->same_waker_runs += 1;
+		return;
 	}
-
+	tctx->last_waker_pid = waker_pid;
+	tctx->same_waker_runs = 0;
 }
 
 // THE SORT KEY IS THE WAIT BASE AND NOTHING ELSE -- A BARE ARRIVAL STAMP, NO
