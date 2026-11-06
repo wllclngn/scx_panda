@@ -173,7 +173,10 @@ use std::process::Command;
 
 fn main() {
     // BUILD ID: GIT SHA, DIRTY FLAG, TARGET TRIPLE. THE EXPORT IS THE SHIPPED
-    // PROGRAM; THE MEASUREMENT ARMS LIVE IN THE STANDALONE TREE.
+    // PROGRAM; THE MEASUREMENT ARMS LIVE IN THE STANDALONE TREE. THE LOADER'S
+    // rank-order ARM IS A cfg THE SOURCE STILL NAMES, SO IT IS DECLARED HERE
+    // AS THE STANDALONE build.rs DECLARES IT, AND NEVER SET.
+    println!("cargo::rustc-check-cfg=cfg(panda_rank_order)");
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
