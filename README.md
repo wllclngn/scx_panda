@@ -1,103 +1,125 @@
 # 🐼
 
-scx_panda is a sched_ext scheduler built from discarded ideas and unspent
-potential, written in C23 for BPF with a Rust loader. Every scheduling decision is made in the kernel. The loader opens
-the program, sizes its topology tables to the box, fills them from sysfs once,
-attaches, and reads counters. Nothing in userspace runs while the scheduler
-runs except a hotplug poll.
+scx_panda is a Linux CPU scheduler built from discarded ideas and unspent
+potential. It runs on the kernel's `sched_ext` class, which lets a scheduler
+written as a BPF program replace the default one while the system is running,
+and it can be switched off again at any time with no reboot.
 
-## What it carries
+It descends from [PANDEMONIUM](https://github.com/wllclngn/PANDEMONIUM), by
+the same author, and is measured with PANDEMONIUM's benches.
 
-**The waterfall.** The per-CPU seat architecture and dispatch ladder of
-PANDEMONIUM v5.24.0, lifted whole: Per-CPU DSQs with a queue clock judged by
-CoDel's control law, admission by backlog in nanoseconds, a direct hand-off
-to an idle CPU, a cutting wake seated on its local DSQ with a preempt kick,
-one task into the local DSQ per dispatch, the aged overflow taken near first,
-the R_eff steal, the bound sweep acting at the clock's own target between
-ticks, the fan-out wake that takes the queue, and every array index masked
-behind a compiler barrier for the verifier.
+## What it does
 
-**The run habit.** One EWMA per task, `avg_run_ns`, fed in `stopping()` from
-the kernel's own service accounting: Seeded on the first run, then
-`avg += (sample - avg) / 8` with a signed shift, the sample clamped to four
-live CoDel targets. It is read as a price and never as a class. `seat_wait()`
-takes the resident's habit as the bound on what the resident has left while
-it runs inside that habit, so a seat whose resident is a 240us job worker
-reads as freeing in microseconds where the granted slice alone read a full
-millisecond, and a wake that would have gone to the shared domain queue is
-admitted to a named seat instead. A resident past its habit is not behaving
-like its history, and the granted slice stands. The two outcomes are counted
-(`expect_used`, `expect_overrun`) and the habit's distribution is exported as
-a log2 histogram, so the price is read against the population it prices.
+A scheduler decides which thread runs on which CPU, and for how long, when
+there are more threads than CPUs. scx_panda makes every one of those
+decisions inside the kernel, in a BPF program written in C. A small Rust
+program loads it, measures the machine's cache layout once, hands the program
+a few tables built from that layout, and then gets out of the way.
 
-**Topology as allocation.** Effective resistance over the cache graph, the
-min-conductance domain tree, tau from the Laplacian spectrum and the CoDel
-equilibrium are computed once by the loader and folded into per-peer tables
-the BPF reads by index. The base knob set (slice, standing ceiling, burst
-ceiling, rescue threshold) is derived from tau inside BPF; no userspace
-writer touches a knob.
+Three ideas carry it:
 
-## What it does not carry
+**Every CPU has its own queue, judged by a clock.** A thread that wakes up is
+seated on one CPU's queue rather than thrown into a shared pile. Each queue
+keeps a clock of how long its oldest waiter has been waiting, and when that
+wait passes a target, the running thread is preempted so the waiter gets in.
+The target comes from CoDel, the same control law that keeps network queues
+short, so a queue that keeps standing is acted on faster and faster until it
+drains.
 
-No adaptive control loop, no sensors, no chaos lenses, no depth ring, no
-per-second knob writes. No task classifier, no tier, no boolean gate on the
-habit. No credit-for-service term in the ordering key: Every queue is
-oldest-first on the arrival stamp.
+**Distance is a price, not a rule.** Moving a thread to another CPU costs
+something, more across a cache boundary than within one. scx_panda measures
+that cost once from the cache layout as an effective resistance, the way one
+measures distance in an electrical network, and every placement decision adds
+it to the wait it is trying to avoid. A thread moves when the move is cheaper
+than waiting, and not before.
 
-## Build and install
+**Each thread's habit is remembered.** The scheduler keeps a running average of
+how long each thread runs before it blocks. When it looks at a busy CPU, it
+uses the current thread's habit to estimate how soon that CPU frees up, so a
+seat held by a thread that always blocks in a few hundred microseconds reads as
+nearly free, and one held by a thread that never blocks reads as taken. The
+habit is only ever a number in a sum. Nothing is classified, and no thread is
+sorted into a tier.
 
-```
-./panda.py check              # build, then load through the verifier without attaching
-./panda.py install --enable   # build, install /usr/local/bin/scx_panda, start it, start it on boot
-./panda.py status
-./panda.py stop               # back to EEVDF
-./panda.py uninstall
-./panda.py prism --dev frame --iterations 5   # PANDEMONIUM's prism with scx_panda as the arm
-./panda.py measure --control --iterations 3   # the measurement-arm A/B on prism-scale
-```
-
-`prism` hands its arguments to PANDEMONIUM's harness in the sibling tree
-(`PANDEMONIUM_DIR` overrides the path) with `--only scx_panda` added unless
-the arguments name the field themselves, refuses to start while another bench
-is running, and starts the service again afterwards if it was active. prism
-asks for sudo itself. `measure` runs the shipped program and each measurement
-arm through prism-scale in turn and prints the reports side by side.
-
-`install` builds into `~/.cache/panda-build`, installs the binary with the
-file capabilities it needs to load without root
-(`cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_nice`), and
-writes `scx_panda.service`. `start` refuses while another sched_ext scheduler
-holds the kernel and names it. The build directory lives outside the source
-tree because libbpf's vendored build does not survive a space in the path.
-The first build on a kernel dumps its BTF to
-`~/.cache/panda/vmlinux-<release>.h` with bpftool, and the loader's sched_ext
-enum values are extracted from that same header at build time, so the program
-and the shims it is given always describe one kernel.
-
-By hand: `CARGO_TARGET_DIR=~/.cache/panda-build cargo build --release`, then
-`scx_panda --check` loads through the verifier and exits without attaching,
-and `scx_panda -v` runs with one counter line per second. On exit the binary
-prints the run habit's histogram and the seat price's two counters.
-
-## scx catalog and export
-
-`catalog/profiles.json` carries the profile scxcli and scxtui start the
-scheduler by once scx's own scx_panda is installed; `panda.py install` offers
-it into `/etc/scx/catalog.json` where scxcli is present. `export_scx.py
-/path/to/scx` lays the crate into `scheds/rust/scx_panda` of an scx checkout
-the way PANDEMONIUM's exporter does: It refuses while an upstream commit to the
-crate is unported, checks scx's catalog, copies the sources and the catalog,
-replaces the build script with scx_cargo's BpfBuilder, swaps the build-time
-enum shims for `scx_utils::scx_enum_init!`, registers the workspace member and
-runs cargo fmt and a build of the crate. `--dry-run` applies the transforms
-without the fetch or the cargo steps. It commits nothing.
+Everything else is bookkeeping: The loader fills the tables, refills them if a
+CPU is plugged in or out, prints counters on request, and restarts the program
+if the kernel asks it to.
 
 ## Requirements
 
-Linux 6.12+ with `CONFIG_SCHED_CLASS_EXT=y`, clang 17+, Rust 1.91+, bpftool
-for the first build on a kernel.
+- Linux 6.12 or later, built with `CONFIG_SCHED_CLASS_EXT=y`
+- clang 17 or later and Rust 1.91 or later, to build
+- bpftool, for the first build on each kernel
+
+## Install
+
+```
+./panda.py install --enable
+```
+
+That builds the program, installs `/usr/local/bin/scx_panda`, writes a
+`scx_panda.service` unit, starts it, and starts it again on every boot. The
+binary carries the file capabilities it needs to load without running as
+root. Everything else you need:
+
+```
+./panda.py status       # what is built, what is installed, what is running
+./panda.py stop         # back to the kernel's default scheduler
+./panda.py start        # scx_panda again (refuses while another sched_ext scheduler is loaded)
+./panda.py uninstall    # remove the binary and the unit
+./panda.py check        # load the program through the kernel's verifier without attaching it
+```
+
+Builds go to `~/.cache/panda-build`, outside the source tree. The first build
+on a kernel saves that kernel's type information under `~/.cache/panda`, and
+the loader's constants are taken from the same file, so the program and the
+values it is given always describe one kernel.
+
+Running it by hand instead: `scx_panda` attaches and runs, `scx_panda -v`
+prints a counter line every second, `scx_panda --version` names the build.
+When it exits it prints a summary and writes the same under
+`/tmp/panda/summary-<time>.txt`; if the kernel ever ejects it, the kernel's
+dump of every queue lands under `/tmp/panda/dump-<time>.txt`.
+
+## Measuring it
+
+scx_panda is scored with PANDEMONIUM's prism benches from a checkout of
+PANDEMONIUM in the sibling directory (`PANDEMONIUM_DIR` points elsewhere if
+needed):
+
+```
+./panda.py prism --dev frame --iterations 5
+```
+
+That runs the frame bench, a stand-in for a game's threads (a simulation
+thread fanning jobs out to workers, a render and submit chain, audio and
+input threads, with and without background load) with scx_panda as the
+scheduler under test. `prism` passes its arguments through and asks for sudo
+itself.
+
+A change to the scheduler is never judged by eye. It is built as a
+measurement arm, the same program with one lever changed, and run against the
+shipped program on the same benches:
+
+```
+./panda.py measure --iterations 3
+```
+
+`measure` installs each arm in turn, runs the frame bench and the scale
+bench on it alone, and prints the results side by side. The arms that exist
+today are listed by `./panda.py measure --help`; each one is a single
+compile-time define, named in the binary's version so no run is ever read
+against the wrong program, and none is left installed afterwards.
+
+## scx catalog and export
+
+`catalog/profiles.json` carries the profile that scxcli and scxtui can start
+the scheduler by once scx's own build of scx_panda is installed; `panda.py
+install` offers it where scxcli is present. `export_scx.py /path/to/scx`
+prepares the crate for the scx repository the way PANDEMONIUM's exporter
+does, and `--dry-run` shows what it would do without touching cargo or the
+network. It commits nothing.
 
 ## License
 
-GPL-2.0-only. The scheduler core descends from PANDEMONIUM by the same
-author.
+GPL-2.0-only.

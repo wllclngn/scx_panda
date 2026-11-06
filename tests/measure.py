@@ -9,8 +9,9 @@ PANDEMONIUM's own two arms from the same evening. The shipped program is
 reinstalled at the end.
 
 Usage:
-    ./tests/measure.py [--arms shipped,no-habit-price] [--benches scale,frame]
-                       [--cores 8,12] [--iterations 1] [--control] [--dry-run]
+    ./tests/measure.py [--arms shipped,band-habit,...] [--benches scale,frame]
+                       [--cores 8,12] [--iterations 1] [--scale-iterations 1]
+                       [--control] [--dry-run]
     ./tests/measure.py --read REPORT [REPORT ...]
 
 --cores applies to scale; frame runs at native width. Runs as the user.
@@ -28,9 +29,11 @@ from pathlib import Path
 
 PANDA_DIR = Path(__file__).resolve().parent.parent
 PANDEMONIUM_DIR = Path(os.environ.get("PANDEMONIUM_DIR", PANDA_DIR.parent / "PANDEMONIUM"))
-REPORT_DIR = Path.home() / ".cache" / "pandemonium"
+# UNDER sudo THE HARNESS WRITES ITS REPORTS TO THE INVOKING USER'S CACHE.
+_HOME = Path(os.path.expanduser(f"~{os.environ['SUDO_USER']}")) if os.environ.get("SUDO_USER") else Path.home()
+REPORT_DIR = _HOME / ".cache" / "pandemonium"
 SUMMARY_DIR = Path("/tmp/panda")
-ARMS = ("shipped", "no-habit-price")
+ARMS = ("shipped", "no-habit-price", "rank-order", "l3-walk")
 BENCHES = ("scale", "frame")
 
 SCALE_METRICS = [
@@ -294,11 +297,14 @@ def parse(name: str, path: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("--arms", default=",".join(ARMS))
+    ap.add_argument("--arms", default=",".join(ARMS),
+                    help=f"comma-separated arms to run, each alone (default all): {', '.join(ARMS)}")
     ap.add_argument("--benches", default=",".join(BENCHES),
                     help="comma-separated: scale, frame (default both)")
     ap.add_argument("--cores", default="8,12", help="scale widths (default 8,12)")
-    ap.add_argument("--iterations", type=int, default=1)
+    ap.add_argument("--iterations", type=int, default=1, help="frame iterations per arm")
+    ap.add_argument("--scale-iterations", type=int, default=1,
+                    help="scale iterations per arm; scale is the saturation guard (default 1)")
     ap.add_argument("--control", action="store_true",
                     help="also run PANDEMONIUM's two arms (prism --pandemonium-only)")
     ap.add_argument("--dry-run", action="store_true", help="print the commands only")
@@ -337,9 +343,11 @@ def main() -> int:
             last = arm
             since = time.time()
             for b in benches:
-                log("INFO", f"arm {arm}: prism {b}, {args.iterations} iteration(s)"
+                log("INFO", f"arm {arm}: prism {b}, "
+                            f"{args.scale_iterations if b == 'scale' else args.iterations} iteration(s)"
                             + (f" at {args.cores} CPUs" if b == "scale" else ""))
-                rep = bench(b, ["--only", "scx_panda"], args.cores, args.iterations, args.dry_run)
+                iters = args.scale_iterations if b == "scale" else args.iterations
+                rep = bench(b, ["--only", "scx_panda"], args.cores, iters, args.dry_run)
                 if rep is None:
                     if not args.dry_run:
                         log("WARN", f"arm {arm}: no {b} report found")
@@ -353,7 +361,8 @@ def main() -> int:
         if args.control:
             for b in benches:
                 log("INFO", f"control: PANDEMONIUM's two arms on {b}")
-                rep = bench(b, ["--pandemonium-only"], args.cores, args.iterations, args.dry_run)
+                iters = args.scale_iterations if b == "scale" else args.iterations
+                rep = bench(b, ["--pandemonium-only"], args.cores, iters, args.dry_run)
                 if rep is not None:
                     results[b].append(("", parse(b, rep)))
                     reports.append((f"control {b}", rep))

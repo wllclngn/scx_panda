@@ -79,10 +79,11 @@ pub struct PandaStats {
     pub nr_seat_expect_used: u64,
     pub nr_seat_expect_overrun: u64,
     pub ewma_hist: [u64; EWMA_HIST_BUCKETS],
+    pub codel_target_live: u64,
 }
 
-// 22 SCALARS + 8 (nr_cross_domain) + 6 SCALARS + 16 (ewma_hist) = 52 u64.
-const _: () = assert!(std::mem::size_of::<PandaStats>() == 52 * 8);
+// 22 SCALARS + 8 (nr_cross_domain) + 6 SCALARS + 16 (ewma_hist) + 1 = 53 u64.
+const _: () = assert!(std::mem::size_of::<PandaStats>() == 53 * 8);
 const _: () = assert!(MAX_AFFINITY_CANDIDATES == MAX_CPUS >> 3);
 
 pub struct Scheduler<'a> {
@@ -254,6 +255,9 @@ impl<'a> Scheduler<'a> {
             t.nr_kick_declined += s.nr_kick_declined;
             t.nr_seat_expect_used += s.nr_seat_expect_used;
             t.nr_seat_expect_overrun += s.nr_seat_expect_overrun;
+            if s.codel_target_live > t.codel_target_live {
+                t.codel_target_live = s.codel_target_live;
+            }
             for i in 0..EWMA_HIST_BUCKETS {
                 t.ewma_hist[i] += s.ewma_hist[i];
             }

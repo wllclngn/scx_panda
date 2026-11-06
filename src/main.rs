@@ -191,6 +191,7 @@ fn print_summary(s: &PandaStats, ev: Option<&ScxEvents>) {
         s.nr_seat_expect_used,
         s.nr_seat_expect_overrun,
     )];
+    lines.push(format!("[PANDA] codel_target_live_ns={}", s.codel_target_live));
     let total: u64 = s.ewma_hist.iter().sum();
     let cells: Vec<String> = s
         .ewma_hist

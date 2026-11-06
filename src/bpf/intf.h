@@ -85,6 +85,7 @@ struct panda_stats {
 	// THE RUN HABIT'S DISTRIBUTION: ONE INCREMENT PER stopping() IN THE
 	// BUCKET floor(log2(avg_run_ns / 1us)), 0 UNDER 2us, 15 FROM 32ms.
 	u64 ewma_hist[16];
+	u64 codel_target_live;   // THE LIVE TARGET, WRITTEN BY CPU 0's TICK; THE BAND EVERY RUN RAN AT
 };
 
 // XDOM PATH INDICES FOR panda_stats.nr_cross_domain[]. POSITIONAL IN THE

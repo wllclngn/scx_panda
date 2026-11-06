@@ -24,7 +24,8 @@ Usage:
     --measure ARM                 With build, rebuild, check or install: a
                                     measurement arm of the program in place of
                                     the shipped one, for an A/B and never left
-                                    installed (no-habit-price)
+                                    installed: no-habit-price, rank-order,
+                                    l3-walk
 """
 
 import json
@@ -51,7 +52,7 @@ SERVICE_PATH = Path(f"/etc/systemd/system/{NAME}.service")
 OPS_PATH = Path("/sys/kernel/sched_ext/root/ops")
 OPS_NAME = "scx_panda"
 CAPS = "cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_nice+ep"
-ARMS = ("no-habit-price",)
+ARMS = ("no-habit-price", "rank-order", "l3-walk")
 PANDEMONIUM_DIR = Path(os.environ.get("PANDEMONIUM_DIR", SCRIPT_DIR.parent / "PANDEMONIUM"))
 MEASURE = SCRIPT_DIR / "tests" / "measure.py"
 BENCH_PATTERNS = ("tests/prism", "pandemonium-tests.py", "tests/measure.py", "framebench")
@@ -83,6 +84,19 @@ def log_error(msg: str) -> None:
 
 def run(cmd: list[str], **kw) -> int:
     return subprocess.run(cmd, **kw).returncode
+
+
+def as_invoking_user(cmd: list[str], env: dict) -> list[str]:
+    """Under sudo, run a build step as the user who invoked it, so cargo never
+    leaves the build directory root-owned. As a plain user, the command as is."""
+    user = os.environ.get("SUDO_USER")
+    if os.geteuid() != 0 or not user:
+        return cmd
+    import pwd
+    home = pwd.getpwnam(user).pw_dir
+    keep = [f"{k}={v}" for k, v in env.items() if k in ("CARGO_TARGET_DIR", "PANDA_MEASURE")]
+    keep += [f"HOME={home}", f"PATH={home}/.cargo/bin:{env.get('PATH', '/usr/bin')}"]
+    return ["sudo", "-u", user, "-H", "env", *keep, *cmd]
 
 
 def capture(cmd: list[str]) -> tuple[int, str]:
@@ -185,15 +199,15 @@ def build(force: bool = False, measure: str = "") -> bool:
         env["PANDA_MEASURE"] = measure
     if force:
         log_info("Cleaning package artifacts")
-        subprocess.run(["cargo", "clean", "-p", NAME], env=env, cwd=SCRIPT_DIR,
-                       capture_output=True)
+        subprocess.run(as_invoking_user(["cargo", "clean", "-p", NAME], env), env=env,
+                       cwd=SCRIPT_DIR, capture_output=True)
         for d in (TARGET_DIR / "release" / "build").glob(f"{NAME}-*"):
             shutil.rmtree(d, ignore_errors=True)
     elif not sources_changed() and binary_arm() == arm:
         log_info(f"Binary up to date ({BINARY.stat().st_size // 1024} KB, arm {arm})")
         return True
     log_info(f"Building release into {TARGET_DIR} (arm {arm})")
-    if run(["cargo", "build", "--release"], env=env, cwd=SCRIPT_DIR) != 0:
+    if run(as_invoking_user(["cargo", "build", "--release"], env), env=env, cwd=SCRIPT_DIR) != 0:
         log_error("Build failed")
         return False
     built = binary_arm()
@@ -417,6 +431,10 @@ def cmd_prism(args: list[str]) -> int:
 
 
 def cmd_measure(args: list[str]) -> int:
+    # HELP, A READ OF EXISTING REPORTS AND A DRY RUN TOUCH NO BENCH, SO THEY
+    # NEED NEITHER THE GUARD NOR THE SERVICE DANCE.
+    if any(a in ("-h", "--help", "--read", "--dry-run") for a in args):
+        return subprocess.run([sys.executable, str(MEASURE), *args], cwd=SCRIPT_DIR).returncode
     return _run_bench([sys.executable, str(MEASURE), *args], SCRIPT_DIR)
 
 

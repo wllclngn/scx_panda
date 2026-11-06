@@ -23,7 +23,7 @@
 #      THE MEASUREMENT ARMS STAY IN THIS TREE, THE EXPORT IS THE SHIPPED PROGRAM
 #   4. SWAPS libbpf-cargo FOR THE scx_cargo PATH+VERSION DEP, ADDS scx_utils
 #   5. STRIPS default-features=false FROM libbpf-rs (VENDORED LIBBPF FOR CI)
-#   6. REPLACES THE BUILD-TIME ENUM SHIMS WITH scx_utils::scx_enum_init!, WHICH
+#   6. REPLACES THE BUILD-TIME ENUM SHIMS WITH scx_utils::import_enums!, WHICH
 #      READS THE RUNNING KERNEL'S BTF AT LOAD; src/scx_enums.rs IS NOT EXPORTED
 #   7. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
 #   8. INJECTS THE VERSION SUFFIX INTO THE OPS NAME FOR scx_loader's DISPLAY
@@ -316,7 +316,7 @@ def patch_enum_shims(dst_root):
     extracted out of the kernel's vmlinux.h. In the monorepo the BPF is built
     against scx's own header set, so the shims come from scx_utils, which reads
     the running kernel's BTF at load. The block goes, the module goes, and
-    scx_enum_init! takes their place after the rodata borrow ends."""
+    import_enums! takes their place after the rodata borrow ends."""
     changes = 0
     lib_path = os.path.join(dst_root, "src", "lib.rs")
     text = open(lib_path).read()
@@ -341,10 +341,10 @@ def patch_enum_shims(dst_root):
     text = text.replace(anchor, anchor
                         + "\n        // THE sched_ext ENUM SHIMS, FROM THE RUNNING KERNEL'S BTF\n"
                         + "        // VIA scx_utils.\n"
-                        + "        scx_utils::scx_enum_init!(open_skel);\n", 1)
+                        + "        scx_utils::import_enums!(open_skel);\n", 1)
     if text != orig:
         open(sched_path, "w").write(text)
-        log_info(f"replaced {len(shims)} build-time shims with scx_utils::scx_enum_init!")
+        log_info(f"replaced {len(shims)} build-time shims with scx_utils::import_enums!")
         changes += 1
     return changes
 

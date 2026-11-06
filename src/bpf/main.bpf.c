@@ -443,6 +443,7 @@ struct {
 	__type(value, u64);
 } last_spill_scan SEC(".maps");
 
+
 // PER-TASK CONTEXT
 
 struct task_ctx {
@@ -593,6 +594,7 @@ static __always_inline u64 queue_wait(const struct queue_clock *q, u64 now)
 }
 
 static __always_inline struct panda_stats *get_stats(void);
+static __always_inline u64 sweep_band_ns(void);
 
 // A SEAT'S WAIT: ITS QUEUE'S WAIT PLUS WHAT THE RESIDENT HAS LEFT. queue_wait
 // SEES QUEUED WORK ONLY, SO A CPU RUNNING ONE TASK WITH AN EMPTY QUEUE READ AS
@@ -647,6 +649,16 @@ static __always_inline u64 seat_wait(s32 cpu, const struct task_struct *self,
 		}
 	}
 #endif
+	// THE BAND BOUNDS ANY WAITER'S TIME BEHIND A RESIDENT, SO THE RESIDENT
+	// TERM NEVER EXCEEDS IT. A HOG'S EMPTY SEAT PRICES AT ONE BAND, NOT FOUR
+	// TARGETS, AND A FAN-OUT WAKE MAY TAKE IT INSTEAD OF STACKING BEHIND OTHER
+	// JOBS ON A WORKER'S SEAT. THE CAP AT THE LIVE TARGET ALONE WAS MEASURED
+	// AND LOST THE DEEP TAIL; AT THE FLOOR IT HOLDS IT.
+	{
+		u64 cap = sweep_band_ns();
+		if (left > cap)
+			left = cap;
+	}
 	return wait + left;
 }
 
@@ -1596,6 +1608,12 @@ static __always_inline void apply_tau_scaling(u64 tau_ns, u64 codel_eq_ns)
 		u32 ceil = (nr_cpu_ids > 1) ? (u32)(nr_cpu_ids - 1) : 1;
 		if (ceil > MAX_AFFINITY_CANDIDATES) ceil = MAX_AFFINITY_CANDIDATES;
 		u32 lo = topo.affinity_domain_peers < 3 ? topo.affinity_domain_peers : 3;
+#ifdef PANDA_L3_WALK
+		// MEASUREMENT ARM: THE WALK FINISHES EVERY IN-DOMAIN PEER BEFORE THE
+		// NODE-WIDE PICK MAY SCATTER THE WAKE ACROSS THE L3. AT 12C A BUDGET
+		// OF THREE GAVE UP TWO PEERS OF THE SHARED-L3 RUNG.
+		lo = topo.affinity_domain_peers;
+#endif
 		if (lo < 1) lo = 1;
 		if (b < lo) b = lo;
 		if (b > ceil) b = ceil;
@@ -2336,6 +2354,27 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 
 #define BOUND_SWEEP_BUDGET 8
 
+// THE BAND A NON-RT RESIDENT ANSWERS TO: THE OSCILLATOR'S FLOOR, NOT THE LIVE
+// TARGET. MEASURED ON FRAME CONTENDED AT N=3: AT THE TARGET THE 1% LOW READ
+// 287 AND THE 0.1% LOW 248; AT THE FLOOR, WITH THE RESIDENT TERM IN
+// seat_wait CAPPED AT THE SAME BAND, 297 AND 254, STUTTERS ZERO, HEAVY HELD.
+// A FAN-OUT WAKE QUEUED BEHIND A HOG IS SERVED AT THE FLOOR; THE PACE, THE
+// TARGET EVERY OTHER SITE PRICES AGAINST, AND lag_cap_ns ARE UNCHANGED. THE
+// TARGET PINNED TO THE FLOOR AT EVERY SITE WAS MEASURED AND LOST THE TAIL.
+static __always_inline u64 sweep_band_ns(void)
+{
+	return codel_target_floor_ns;
+}
+
+// THE PACE OF THE SWEEP'S ACT ON ONE QUEUE: CoDel's CONTROL LAW SCHEDULES THE
+// NEXT ACT AT pace / sqrt(acts). THE PACE STAYS THE LIVE TARGET; PACING AT
+// THE FLOOR, WITH THE WINDOW STEPPING EVERY 131 us, WAS MEASURED AND MOVED
+// NEITHER THE AVERAGE NOR THE WAKE TAIL.
+static __always_inline u64 sweep_pace_ns(void)
+{
+	return codel_target_ns;
+}
+
 // A RESIDENT STILL OWED ITS FIRST TARGET: IT HAS RUN UNDER codel_target_ns
 // SINCE IT TOOK THE CPU, SO IT HAS NOT YET HAD WHAT THE CLOCK PROMISES ANY TASK
 // BEFORE IT IS JUDGED. PREEMPTED THERE IT REQUEUES WITH ITS WORK LEFT, AND ONE
@@ -2380,8 +2419,8 @@ static __always_inline void sweep_bound_preempt(u64 now, u32 self)
 		// SWEEP JUDGES THE SEAT AGAIN. lag_cap_ns STAYS THE UNPACED BACKSTOP.
 		if (!pcpu_kick_owed(c, w, lag_cap_ns, now) &&
 		    !resident_owed(c, now) &&
-		    queue_act(&pcpu_qclock[cpu_slot(c)], w, codel_target_ns,
-			      codel_target_ns, now))
+		    queue_act(&pcpu_qclock[cpu_slot(c)], w, sweep_band_ns(),
+			      sweep_pace_ns(), now))
 			scx_bpf_kick_cpu((s32)c, SCX_KICK_PREEMPT);
 	}
 	// OVERFLOW BOUND: AN OVERFLOW HEAD AGED PAST lag_cap_ns IS DRAINED BY STEP 2
@@ -2482,7 +2521,8 @@ static int steal_scan_step(u32 i, void *ctx_)
 					phi_thresh += hold;
 				}
 			}
-			if (peer_wait >= (nq > 1 ? phi_thresh : phi_thresh + codel_target_ns) /* LONE-TASK STARVATION RESCUE (nq==1): the surplus>1 rule pins a lone WARM task for cache locality, but montauk's dispatch-stall shows a lone burst wakee stranded on a BUSY peer's per-CPU DSQ is served 0% by that peer's STEP 0 (MIRROR, PREEMPT-STARVED) and 100% by steal (SUB), tailing to 100ms-947ms (worst 26.7s at 2C) since the only other rescue -- tick()'s rotating sojourn scan -- is sparse and never fires on an idle/all-idle-at-low-width topology. A lone task aged past the overflow window is no longer warm-worth-pinning: steal it here, far below the ~167ms net. Phi still prices distance; fresh lone tasks (< the window) stay pinned. */) {
+			u64 expected_wait = peer_wait;
+			if (expected_wait >= (nq > 1 ? phi_thresh : phi_thresh + codel_target_ns) /* LONE-TASK STARVATION RESCUE (nq==1): the surplus>1 rule pins a lone WARM task for cache locality, but montauk's dispatch-stall shows a lone burst wakee stranded on a BUSY peer's per-CPU DSQ is served 0% by that peer's STEP 0 (MIRROR, PREEMPT-STARVED) and 100% by steal (SUB), tailing to 100ms-947ms (worst 26.7s at 2C) since the only other rescue -- tick()'s rotating sojourn scan -- is sparse and never fires on an idle/all-idle-at-low-width topology. A lone task aged past the overflow window is no longer warm-worth-pinning: steal it here, far below the ~167ms net. Phi still prices distance; fresh lone tasks (< the window) stay pinned. */) {
 				c->best_peer = (s32)peer;
 				return 1;
 			}
@@ -2984,6 +3024,7 @@ void BPF_STRUCT_OPS(panda_tick, struct task_struct *p)
 
 	if (s) {
 		s->longrun_mode_active = longrun_mode ? 1 : 0;
+		s->codel_target_live = codel_target_ns;
 	}
 
 	// THIS CPU'S DOMAIN OVERFLOW AGE. THE PER-CPU SOJOURN ENFORCEMENT BELOW IS
@@ -3132,7 +3173,7 @@ void BPF_STRUCT_OPS(panda_tick, struct task_struct *p)
 	// IT HAS CAMPED ON, JUST NEVER PART-WAY THROUGH A PERIOD.
 	// p->policy IS READ DIRECTLY, SO THE TICK NEEDS NO task_ctx LOOKUP.
 	u64 band = (p->policy == SCHED_FIFO || p->policy == SCHED_RR)
-		 ? lag_cap_ns : codel_target_ns;
+		 ? lag_cap_ns : sweep_band_ns();
 	u64 thresh = longrun_mode ? (band << longrun_preempt_shift) : band;
 
 	if (wait_age >= thresh) {
@@ -3174,8 +3215,6 @@ void BPF_STRUCT_OPS(panda_enable, struct task_struct *p)
 // INIT: DETECT TOPOLOGY, CREATE DSQs, CALIBRATE
 s32 BPF_STRUCT_OPS_SLEEPABLE(panda_init)
 {
-	u32 zero = 0;
-
 	nr_nodes = __COMPAT_scx_bpf_nr_node_ids();
 	if (nr_nodes < 1)
 		nr_nodes = 1;
@@ -3230,6 +3269,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(panda_init)
 	// tau LEAVES THE MIDPOINT FALLBACKS ABOVE IN PLACE UNTIL THE FIRST TICK
 	// AFTER IT LANDS.
 	apply_tau_scaling(topo.tau_ns, topo.codel_eq_ns);
+
 
 	return 0;
 }

@@ -72,13 +72,15 @@ fn main() {
     // BUILT FOR AN A/B AND NEVER SHIPPED: THE DEFINE REACHES clang AND THE
     // ARM'S NAME RIDES IN THE BINARY'S VERSION, BANNER AND SUMMARY.
     let measure = env::var("PANDA_MEASURE").unwrap_or_default();
-    let (arm, define) = match measure.as_str() {
-        "" | "shipped" => ("shipped", None),
-        "no-habit-price" => ("no-habit-price", Some("-DPANDA_NO_HABIT_PRICE")),
-        other => panic!("PANDA_MEASURE={other}: the one arm is no-habit-price"),
+    let (arm, defines): (&str, &[&str]) = match measure.as_str() {
+        "" | "shipped" => ("shipped", &[]),
+        "no-habit-price" => ("no-habit-price", &["-DPANDA_NO_HABIT_PRICE"]),
+        "rank-order" => ("rank-order", &[]),
+        "l3-walk" => ("l3-walk", &["-DPANDA_L3_WALK"]),
+        other => panic!("PANDA_MEASURE={other}: the arms are no-habit-price, rank-order and l3-walk"),
     };
-    if let Some(d) = define {
-        cflags.push(d.into());
+    for d in defines {
+        cflags.push((*d).into());
     }
 
     SkeletonBuilder::new()
@@ -92,6 +94,11 @@ fn main() {
     println!("cargo:rerun-if-changed=include/scx");
     println!("cargo:rerun-if-env-changed=PANDA_MEASURE");
     println!("cargo:rustc-env=PANDA_ARM={arm}");
+    // THE LOADER-ONLY ARM IS A RUST cfg, NOT A clang DEFINE.
+    println!("cargo::rustc-check-cfg=cfg(panda_rank_order)");
+    if arm == "rank-order" {
+        println!("cargo:rustc-cfg=panda_rank_order");
+    }
 
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
