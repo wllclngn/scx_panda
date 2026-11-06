@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Will Clingan
 # scx_panda -> scx MONOREPO EXPORT
 # AUTOMATES THE IMPORT PROCESS FOR sched-ext/scx, AFTER PANDEMONIUM's.
 #
@@ -74,6 +76,7 @@ INCLUDE = [
     "Cargo.toml",
     "LICENSE",
     "README.md",
+    "assets/",
     "build.rs",
     "src/",
     "veristat/",
@@ -169,6 +172,8 @@ def strip_profile_release(dst_root):
 
 
 SCX_BUILD_RS = """\
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Will Clingan
 use std::process::Command;
 
 fn main() {

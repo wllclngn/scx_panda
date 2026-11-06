@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Will Clingan
 // scx_panda BUILD SCRIPT
 // COMPILES src/bpf/main.bpf.c INTO BPF BYTECODE, GENERATES THE RUST SKELETON
 // AND EXTRACTS EVERY sched_ext ENUM VALUE FROM THE KERNEL'S OWN vmlinux.h INTO
