@@ -12,12 +12,15 @@
 #   RERUN WITH --ported NAMING EVERY LISTED HASH. A CRATE THAT HAS NEVER BEEN
 #   RELEASED UPSTREAM IS THE FIRST IMPORT, AND PASSES.
 #   READS scx's SCHEDULER CATALOG (services/catalog.json), WHICH scxcli AND
-#   scxtui START SCHEDULERS FROM. A CRATE LISTED BELOW STABLE IS REFUSED; ONE
-#   NOT LISTED AT ALL IS THE FIRST IMPORT, AND THE PR ADDS IT.
+#   scxtui START SCHEDULERS FROM. A CRATE LISTED hidden IS REFUSED; ONE NOT
+#   LISTED AT ALL IS THE FIRST IMPORT AND IS LISTED experimental, IN THE
+#   CATALOG AND IN scx_catalog's FIXTURE OF IT.
 #
 # WHAT IT DOES:
-#   1. COPIES SOURCE FILES INTO scheds/rust/scx_panda/, catalog/profiles.json
-#      INCLUDED FOR AN ADMINISTRATOR's /etc/scx/catalog.json
+#   1. COPIES SOURCE FILES INTO THE CRATE'S DIRECTORY: WHERE THE CHECKOUT
+#      ALREADY HAS IT, ELSE scheds/experimental/scx_panda/, THE TIER A FIRST
+#      IMPORT LANDS IN. catalog/profiles.json STAYS IN THIS TREE FOR AN
+#      ADMINISTRATOR's /etc/scx/catalog.json; scx's CATALOG IS CENTRAL.
 #   2. STRIPS [profile.release] (THE WORKSPACE PROVIDES ITS OWN)
 #   3. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS);
 #      THE MEASUREMENT ARMS STAY IN THIS TREE, THE EXPORT IS THE SHIPPED PROGRAM
@@ -50,10 +53,21 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from panda import log_error, log_info, log_warn, scx_profiles, version  # noqa: E402
+from panda import log_error, log_info, log_warn, version  # noqa: E402
 
 CRATE = "scx_panda"
-DEST_REL = os.path.join("scheds", "rust", CRATE)
+TIERS = ("scheds/rust", "scheds/experimental")
+CATALOGS = ("services/catalog.json",
+            "rust/scx_catalog/fixtures/catalog/valid/shipped.json")
+
+
+def dest_rel(scx_root):
+    """The crate's path in the checkout: Where the checkout already has it,
+    else the experimental tier, where a first import lands."""
+    for tier in TIERS:
+        if os.path.isdir(os.path.join(scx_root, tier, CRATE)):
+            return os.path.join(tier, CRATE)
+    return os.path.join("scheds", "experimental", CRATE)
 
 # FILES TO COPY (RELATIVE TO THE panda ROOT)
 INCLUDE = [
@@ -61,7 +75,6 @@ INCLUDE = [
     "LICENSE",
     "README.md",
     "build.rs",
-    "catalog/",
     "src/",
     "veristat/",
 ]
@@ -396,38 +409,48 @@ def patch_ops_version_suffix(dst_root):
 
 
 def add_workspace_member(scx_root):
+    """Add the crate to the root manifest's members, inside the run of entries
+    that share its tier directory, before the first that sorts after it."""
     cargo_path = os.path.join(scx_root, "Cargo.toml")
     if not os.path.exists(cargo_path):
         log_warn(f"{cargo_path} not found, skipping workspace registration")
         return 0
+    dest = dest_rel(scx_root)
     text = open(cargo_path).read()
-    member_line = f'    "{DEST_REL}",'
     # THE QUOTED PATH: scheds/rust/scx_panda IS A PREFIX OF scx_pandemonium.
-    if f'"{DEST_REL}"' in text:
+    if f'"{dest}"' in text:
         log_info("workspace member already registered")
         return 0
-    lines, out, inserted, in_members = text.split("\n"), [], False, False
-    for line in lines:
-        if line.strip() == "members = [":
+    member_line = f'    "{dest}",'
+    run = f'"{os.path.dirname(dest)}/'
+    lines = text.split("\n")
+    # THE TIER'S RUN IS NOT KEPT SORTED UPSTREAM; THE MEMBER GOES AFTER THE
+    # LAST ENTRY OF ITS TIER THAT SORTS BEFORE IT, OR AT THE RUN'S HEAD, OR
+    # BEFORE THE CLOSING BRACKET WHEN THE TIER HAS NO ENTRY YET.
+    at, in_members, run_head = None, False, None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "members = [":
             in_members = True
-            out.append(line)
             continue
-        if in_members and not inserted:
-            stripped = line.strip()
-            if stripped == "]":
-                out.append(member_line)
-                inserted = True
-            elif stripped.startswith('"') and stripped.rstrip(",") > f'"{DEST_REL}"':
-                out.append(member_line)
-                inserted = True
-                in_members = False
-        out.append(line)
-    if inserted:
-        open(cargo_path, "w").write("\n".join(out))
-        log_info(f"added {DEST_REL} to workspace members")
-        return 1
-    log_warn("could not find an insertion point in workspace Cargo.toml")
-    return 0
+        if not in_members:
+            continue
+        if stripped.startswith(run):
+            if run_head is None:
+                run_head = i
+            if stripped.rstrip(",") < f'"{dest}"':
+                at = i + 1
+        elif stripped == "]":
+            if at is None:
+                at = run_head if run_head is not None else i
+            break
+    if at is None:
+        log_warn("could not find an insertion point in workspace Cargo.toml")
+        return 0
+    lines.insert(at, member_line)
+    open(cargo_path, "w").write("\n".join(lines))
+    log_info(f"added {dest} to workspace members")
+    return 1
 
 
 def git(cwd, *args):
@@ -453,19 +476,20 @@ def require_upstream_ported(scx_root, ported):
         log_error(f"git fetch {remote} main failed: {r.stderr.strip()}")
         sys.exit(1)
     main_ref = f"{remote}/main"
+    paths = [os.path.join(tier, CRATE) for tier in TIERS]
     r = git(scx_root, "log", main_ref, "-1", "--format=%h", "-i", "-E",
-            f"--grep=^{CRATE}v[0-9]", "--", DEST_REL)
+            f"--grep=^{CRATE}v[0-9]", "--", *paths)
     last = r.stdout.strip()
     if not last:
-        exists = git(scx_root, "cat-file", "-e", f"{main_ref}:{DEST_REL}").returncode == 0
-        if exists:
-            log_error(f"{DEST_REL} exists on {main_ref} with no {CRATE} release "
-                      "commit; review it before an export replaces it")
-            sys.exit(1)
+        for rel in paths:
+            if git(scx_root, "cat-file", "-e", f"{main_ref}:{rel}").returncode == 0:
+                log_error(f"{rel} exists on {main_ref} with no {CRATE} release "
+                          "commit; review it before an export replaces it")
+                sys.exit(1)
         log_info(f"no {CRATE} release on {main_ref}: the first import")
         return
     r = git(scx_root, "log", "--no-merges", "--format=%h%x09%an%x09%s",
-            f"{last}..{main_ref}", "--", DEST_REL)
+            f"{last}..{main_ref}", "--", *paths)
     since = [line.split("\t") for line in r.stdout.splitlines()]
     unported = [c for c in since
                 if not any(c[0].startswith(p) or p.startswith(c[0]) for p in ported)]
@@ -476,45 +500,68 @@ def require_upstream_ported(scx_root, ported):
         log_error("port each into this tree, then rerun with --ported naming every hash")
         report("\n".join([f"{'HASH':<12}{'AUTHOR':<20}SUBJECT"]
                          + [f"{h:<12}{author:<20}{subject}" for h, author, subject in unported]))
-        log_info(f"REVIEW: git -C {scx_root} show HASH -- {DEST_REL}")
+        log_info(f"REVIEW: git -C {scx_root} show HASH -- {' '.join(paths)}")
         sys.exit(1)
 
 
-def require_catalog(scx_root):
-    """scx's catalog lists the crate featured or stable, or not at all yet, and
-    the profiles the crate ships pass the catalog's rules and take no id the
-    catalog already uses."""
-    try:
-        profiles = scx_profiles()
-    except (OSError, ValueError) as e:
-        log_error(str(e))
-        sys.exit(1)
-    path = os.path.join(scx_root, "services", "catalog.json")
-    if not os.path.exists(path):
-        log_warn("services/catalog.json not found: this scx predates the "
-                 "catalog; the profiles ship in the crate regardless")
-        return
-    with open(path) as f:
-        catalog = json.load(f)
-    tiers = [t for t in ("featured", "stable", "experimental", "hidden")
-             if CRATE in (catalog.get(t) or [])]
-    if tiers and not ({"featured", "stable"} & set(tiers)):
-        log_error(f"{CRATE} is listed {'/'.join(tiers)} in scx's catalog "
-                  "(services/catalog.json); scxcli and scxtui would not present "
-                  "it as stable. Settle that in scx first")
-        sys.exit(1)
-    if not tiers:
-        log_warn(f"{CRATE} is not in scx's catalog yet; the import PR adds it to "
-                 "services/catalog.json")
-    taken = ({r.get("id") for r in catalog.get("recommended", [])}
-             | {s for t in ("featured", "hidden", "stable", "experimental")
-                for s in (catalog.get(t) or [])})
-    clash = [p["id"] for p in profiles if p["id"] in taken]
-    if clash:
-        log_error(f"profile id(s) already taken in scx's catalog: {', '.join(clash)}")
-        sys.exit(1)
-    log_info(f"catalog: {CRATE} is {tiers[0] if tiers else 'unlisted'}; ships "
-             "profile(s) " + ", ".join(p["id"] for p in profiles))
+def insert_in_array(text, key, name):
+    """Insert "name" into the JSON array under key, keeping the file's own
+    layout: One entry per line, before the first entry that sorts after it,
+    or last. None when the array is not in the text."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() == f'"{key}": [':
+            break
+    else:
+        return None
+    indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())] + "  "
+    j = i + 1
+    while j < len(lines):
+        stripped = lines[j].strip()
+        if stripped.startswith("]"):
+            if j - 1 > i and not lines[j - 1].rstrip().endswith(","):
+                lines[j - 1] = lines[j - 1].rstrip() + ","
+            lines.insert(j, f'{indent}"{name}"')
+            return "\n".join(lines)
+        indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
+        if stripped.rstrip(",").strip('"') > name:
+            lines.insert(j, f'{indent}"{name}",')
+            return "\n".join(lines)
+        j += 1
+    return None
+
+
+def register_catalog(scx_root):
+    """scx's catalog, and scx_catalog's fixture of it, list the crate in a
+    tier or not at all. hidden is refused; unlisted is the first import and
+    is listed experimental, the tier the crate's directory sits in."""
+    done = 0
+    for rel in CATALOGS:
+        path = os.path.join(scx_root, rel)
+        if not os.path.exists(path):
+            if rel == CATALOGS[0]:
+                log_warn("services/catalog.json not found: this scx predates the catalog")
+            continue
+        text = open(path).read()
+        catalog = json.loads(text)
+        tiers = [t for t in ("featured", "stable", "experimental", "hidden")
+                 if CRATE in (catalog.get(t) or [])]
+        if tiers == ["hidden"]:
+            log_error(f"{CRATE} is hidden in {rel}; scxcli and scxtui would not "
+                      "present it. Settle that in scx first")
+            sys.exit(1)
+        if tiers:
+            log_info(f"{rel}: {CRATE} is {tiers[0]}")
+            continue
+        new = insert_in_array(text, "experimental", CRATE)
+        if new is None:
+            log_error(f"{rel}: no experimental array to list {CRATE} in")
+            sys.exit(1)
+        json.loads(new)
+        open(path, "w").write(new)
+        log_info(f"{rel}: {CRATE} listed experimental")
+        done += 1
+    return done
 
 
 def run_checked(cmd, cwd, label):
@@ -569,7 +616,8 @@ def main():
 
     scx_root = os.path.abspath(args[0])
     panda_root = os.path.dirname(os.path.abspath(__file__))
-    dst_root = os.path.join(scx_root, DEST_REL)
+    dest = dest_rel(scx_root)
+    dst_root = os.path.join(scx_root, dest)
 
     if not os.path.isdir(scx_root):
         log_error(f"{scx_root} is not a directory")
@@ -587,13 +635,13 @@ def main():
         log_info("dry run: the upstream fetch is skipped")
     else:
         require_upstream_ported(scx_root, ported)
-    section("catalog: CHECK")
-    require_catalog(scx_root)
+    section("catalog: REGISTER")
+    listed = register_catalog(scx_root)
 
     section("source: COPY")
     if os.path.exists(dst_root):
         shutil.rmtree(dst_root)
-        log_info(f"removed the existing {DEST_REL}/")
+        log_info(f"removed the existing {dest}/")
     os.makedirs(dst_root, exist_ok=True)
     copied = copy_tree(panda_root, dst_root)
     assert_export_is_exactly_include(dst_root)
@@ -636,7 +684,7 @@ def main():
 
     print()
     log_info(f"EXPORT COMPLETE: {copied} files copied, {stripped} profile stripped, "
-             f"{registered} workspace update")
+             f"{registered} workspace update, {listed} catalog update(s)")
     if body:
         log_info(f"PR BODY: {body}")
     log_info(f"NEXT: cd {scx_root} && git add -A && git diff --cached --stat")

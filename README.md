@@ -117,8 +117,10 @@ against the wrong program, and none is left installed afterwards.
 the scheduler by once scx's own build of scx_panda is installed; `panda.py
 install` offers it where scxcli is present. `export_scx.py /path/to/scx`
 prepares the crate for the scx repository the way PANDEMONIUM's exporter
-does, and `--dry-run` shows what it would do without touching cargo or the
-network. It commits nothing.
+does: On a first import it lands the crate in `scheds/experimental` and lists
+it as experimental in scx's catalog, and on a later one it replaces the crate
+where the checkout has it. `--dry-run` shows what it would do without
+touching cargo or the network. It commits nothing.
 
 ## License
 
