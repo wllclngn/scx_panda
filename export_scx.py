@@ -401,10 +401,11 @@ def add_workspace_member(scx_root):
         log_warn(f"{cargo_path} not found, skipping workspace registration")
         return 0
     text = open(cargo_path).read()
-    if DEST_REL in text:
+    member_line = f'    "{DEST_REL}",'
+    # THE QUOTED PATH: scheds/rust/scx_panda IS A PREFIX OF scx_pandemonium.
+    if f'"{DEST_REL}"' in text:
         log_info("workspace member already registered")
         return 0
-    member_line = f'    "{DEST_REL}",'
     lines, out, inserted, in_members = text.split("\n"), [], False, False
     for line in lines:
         if line.strip() == "members = [":
@@ -618,7 +619,16 @@ def main():
     else:
         manifest = os.path.join(dst_root, "Cargo.toml")
         run_checked(["cargo", "fmt", "--manifest-path", manifest], scx_root, "cargo fmt")
-        run_checked(["cargo", "update", "-p", CRATE], scx_root, "cargo update")
+        # cargo update -p MATCHES THE SPEC AGAINST THE LOCKFILE'S PACKAGES, SO
+        # A MEMBER JUST ADDED TO THE WORKSPACE IS NOT THERE YET; --workspace
+        # ENTERS THE NEW MEMBER AND ITS EDGES WITHOUT MOVING ANY OTHER VERSION.
+        lock = os.path.join(scx_root, "Cargo.lock")
+        locked = os.path.exists(lock) and f'name = "{CRATE}"' in open(lock).read()
+        if locked:
+            run_checked(["cargo", "update", "-p", CRATE], scx_root, "cargo update")
+        else:
+            run_checked(["cargo", "update", "--workspace"], scx_root,
+                        "cargo update --workspace (first entry in Cargo.lock)")
         run_checked(["cargo", "fmt", "--check", "-p", CRATE], scx_root, "cargo fmt --check")
         run_checked(["cargo", "build", "-p", CRATE, "--release"], scx_root, "cargo build")
 
