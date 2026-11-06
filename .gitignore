@@ -1,0 +1,29 @@
+# Rust
+/target/
+Cargo.lock
+
+# C/BPF: objects, depfiles, the generated skeleton and static-lane artefacts.
+# build.rs regenerates the skeleton and caches vmlinux.h under ~/.cache/panda.
+*.o
+*.d
+*.skel.rs
+*.guards
+/include/vmlinux.h
+/include/vmlinux/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ledger and record: local only, as in PANDEMONIUM. The record cites silica's
+# archive and the research tree, neither of which is published.
+COMMIT_MESSAGE.txt
+ROADMAP.md
+FINDINGS.md
+
+# Captures, reports, dumps and root screenshots never enter the tree.
+*.prom
+*.events
+*.log
+/*.png

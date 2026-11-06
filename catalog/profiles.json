@@ -1,0 +1,9 @@
+[
+  {
+    "id": "panda",
+    "label": "scx_panda",
+    "description": "scx_panda: every decision in BPF, the run habit read as a price; no options.",
+    "sched": "scx_panda",
+    "args": []
+  }
+]
