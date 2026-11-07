@@ -480,6 +480,8 @@ struct task_ctx {
 	                     // SATURATING. A 1:1 EXCHANGE CLIMBS IT; A PRODUCER
 	                     // WAKING ITS WORKERS IN TURN RESETS IT EVERY WAKE.
 	s32 last_cpu;        // LAST CPU THIS TASK RAN ON (FOR CACHE AFFINITY)
+	u32 handoff_seat;    // DSQ ID + 1 OF A DIRECT HAND-OFF'S SEAT, WHOSE CLOCK running()
+	                     // WRITES ON THAT CPU; 0 = NONE. SEE seat_handoff_fast.
 	s32 home_cpu;        // STABLE PLACEMENT HOME: PINNED TO THE FIRST CPU THE
 	                     // TASK RAN ON; NEVER CHASES last_cpu. WARM-STAY ANCHOR
 	                     // SO THE TASK RETURNS HOME INSTEAD OF DRIFTING. THE
@@ -627,10 +629,16 @@ static __always_inline u64 seat_wait(s32 cpu, const struct task_struct *self,
 	struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(cpu);
 	if (!curr || curr == self)
 		return wait;
-	if ((BPF_CORE_READ(curr, flags) & PF_IDLE) ||
-	    !(BPF_CORE_READ(curr, scx.flags) & SCX_TASK_QUEUED))
+	// THE RESIDENT IS READ THROUGH ITS POINTER. scx_bpf_cpu_curr() HANDS
+	// BACK AN RCU-PROTECTED task_struct THE VERIFIER LETS A PROGRAM LOAD
+	// FROM, EACH FIELD ONE FAULTING LOAD IN THE JIT. BPF_CORE_READ MADE EACH
+	// OF THE THREE A bpf_probe_read_kernel HELPER CALL: 24 CALL SITES IN
+	// select_cpu AND 9 IN enqueue, THREE ON EVERY BUSY SEAT PRICED. THE SAME
+	// THREE FIELDS ARE READ, SO THE PRICE IS UNCHANGED.
+	if ((curr->flags & PF_IDLE) ||
+	    !(curr->scx.flags & SCX_TASK_QUEUED))
 		return wait;
-	u64 left = BPF_CORE_READ(curr, scx.slice);
+	u64 left = curr->scx.slice;
 	if (left > codel_starve_ns)
 		left = codel_starve_ns;
 	// MEASUREMENT ARM: -DPANDA_NO_HABIT_PRICE LEAVES THE HABIT TERM OUT, SO
@@ -791,8 +799,11 @@ static u32 affinity_search_online = 3;
 // RETURNS THE NEAREST IDLE CPU IN R_eff ORDER, OR -1 IF NONE IS IDLE WITHIN
 // BUDGET. THE CPU IT RETURNS IS CLAIMED: ITS IDLE BIT IS CLEAR, SO THE CALLER
 // MUST SEAT THERE.
+// src_allowed: THE CALLER ALREADY TESTED src_cpu AGAINST allowed AND IT
+// PASSED, SO THE ANCHOR'S MASK TEST IS NOT ASKED A SECOND TIME.
 static __always_inline s32 find_idle_by_affinity(s32 src_cpu,
-						 const struct cpumask *allowed)
+						 const struct cpumask *allowed,
+						 bool src_allowed)
 {
 	if (src_cpu < 0 || (u32)src_cpu >= nr_cpu_ids)
 		return -1;
@@ -803,7 +814,7 @@ static __always_inline s32 find_idle_by_affinity(s32 src_cpu,
 	// SIBLING, NOT SELF.
 	// AN IDLE PEER CANNOT START THE TASK SOONER THAN AN IDLE ANCHOR AND COSTS AN
 	// L2 RELOAD OF ~4,500 LLC REFERENCES, SO THE ANCHOR WINS WHEN BOTH ARE IDLE.
-	if ((!allowed || bpf_cpumask_test_cpu(src_cpu, allowed)) &&
+	if ((src_allowed || !allowed || bpf_cpumask_test_cpu(src_cpu, allowed)) &&
 	    scx_bpf_test_and_clear_cpu_idle(src_cpu))
 		return src_cpu;
 
@@ -890,9 +901,10 @@ static __always_inline bool seat_cut(struct task_struct *p, s32 seat, u64 sl,
 // A BUSY PLACEMENT FROM THIS PATH WOULD ISSUE SCX_KICK_IDLE, A NO-OP ON A BUSY
 // CPU, AND STRAND THE WAKEE UNTIL THE RESIDENT YIELDED.
 static __always_inline s32 phi_warm_target(s32 anchor,
-					   const struct cpumask *allowed)
+					   const struct cpumask *allowed,
+					   bool anchor_allowed)
 {
-	return find_idle_by_affinity(anchor, allowed);
+	return find_idle_by_affinity(anchor, allowed, anchor_allowed);
 }
 
 // WARM-STAY GATE. RETURNS THE ANCHOR TO HOLD THE WAKEE ON WHILE THAT ANCHOR IS
@@ -992,9 +1004,10 @@ static __always_inline u64 requeue_kick_flag(const struct task_ctx *tctx,
 {
 	if (target < 0 || (u64)target >= nr_cpu_ids)
 		return floor;
-	// AN IDLE SEAT HAS NO RESIDENT TO DISLODGE. Ask the seat, not the task.
-	if (!__COMPAT_scx_bpf_cpu_curr(target))
-		return floor;
+	// NO RESIDENT TEST. scx_bpf_cpu_curr() IS NEVER NULL FOR A CPU INSIDE
+	// nr_cpu_ids -- AN IDLE SEAT'S curr IS ITS IDLE TASK -- SO THE NULL TEST
+	// THAT STOOD HERE NEVER RETURNED, AND EVERY PRICED SEAT PAID A KFUNC AND
+	// THE SEAT'S rq LINE FOR IT. TIER 2's ENTRY TEST WAS THE SAME CALL.
 	if (is_wakeup)
 		return wake_cuts(tctx) ? SCX_KICK_PREEMPT : floor;
 	u32 rbase = (u32)target * MAX_AFFINITY_CANDIDATES;
@@ -1033,7 +1046,7 @@ static __always_inline enum seat_how seat_task(struct task_struct *p,
 					       struct task_ctx *tctx, s32 seat,
 					       s32 claimed, u64 dsq, u64 sl,
 					       u64 dl, bool may_cut, u64 kick,
-					       u64 enq_flags)
+					       u64 enq_flags, u64 now)
 {
 	enum seat_how how = SEAT_QUEUED;
 	if (seat_direct(p, seat, claimed, sl, enq_flags))
@@ -1043,16 +1056,76 @@ static __always_inline enum seat_how seat_task(struct task_struct *p,
 		how = SEAT_CUT;
 	else
 		scx_bpf_dsq_insert_vtime(p, dsq, sl, dl, enq_flags);
-	qclock_arrive(tctx, dsq, bpf_ktime_get_ns());
+	// how IS MADE OPAQUE HERE SO CLANG DOES NOT THREAD THE KICK TEST BACK INTO
+	// THE THREE ARMS ABOVE AND COPY THE ARRIVAL INTO EACH. THE CLOCK READ THAT
+	// STOOD HERE KEPT THEM APART; WITHOUT IT THE COPIES ADDED 8 TO
+	// select_cpu's CYCLOMATIC COUNT AND 4 TO enqueue's ON montauk's STATIC LANE.
+	asm volatile("" : "+r"(how));
+	// THE ARRIVAL TAKES THE CALLER'S CLOCK WHERE A FRESH READ AFTER THE INSERT
+	// STOOD. EVERY CALLER READS IT AFTER ITS PICK, SO THE STAMP MOVES ONLY BY
+	// THE STRAIGHT-LINE WORK FROM THERE TO THE INSERT: THE KICK PRICE, THE
+	// HAND-OFF TEST AND THE INSERT ITSELF. A READ TAKEN BEFORE A PICK WOULD
+	// MOVE IT BY THE SPILL WALK, ON EXACTLY THE LOADED SEATS WHOSE CLOCKS
+	// dispatch COMPARES AGAINST THE OVERFLOW'S.
+	qclock_arrive(tctx, dsq, now);
 	if (how == SEAT_QUEUED && kick != KICK_NONE)
 		scx_bpf_kick_cpu(seat, kick);
 	return how;
 }
 
+// THE COMMON WAKE, SEATED LEAN. THE WALK CLAIMED AN IDLE target; WHEN ITS
+// PER-CPU QUEUE IS EMPTY THE FULL PICK RETURNS IT (AN EMPTY QUEUE BEHIND AN
+// IDLE RESIDENT WAITS ZERO) AND seat_direct HANDS IT OFF, SO THE SEAT PRICE,
+// THE SPILL SEARCH AND TWO OF THE THREE CLOCK READS DECIDE NOTHING AND ARE
+// LEFT OUT. WHAT THE FULL PATH WOULD HAVE WRITTEN IS WRITTEN HERE: THE
+// PARTNER'S WARM STAMP, THE WAIT BASE, THE SEAT'S CLOCK. MEASURED FROM THE
+// WAKER'S SIDE: THE FRAME'S TEN-WAKE FUTEX CALL READ 47.7 us AGAINST EEVDF'S
+// 13.4 WITH EVERY WAKE PAYING THE FULL PATH, 4.9 us A WAKE AGAINST 1.65, OF
+// WHICH select_cpu WAS 1.4. A QUEUE THAT IS NOT EMPTY TAKES THE FULL PATH.
+static __always_inline u64 task_slice(const struct task_ctx *tctx,
+				      const struct tuning_knobs *knobs);
+
+static __always_inline bool seat_handoff_fast(struct task_struct *p,
+					      struct task_ctx *tctx, s32 target,
+					      const struct tuning_knobs *knobs)
+{
+	if ((u64)target >= nr_cpu_ids || scx_bpf_dsq_nr_queued((u64)target))
+		return false;
+	u64 now = bpf_ktime_get_ns();
+	u64 sl = 1000000;
+	if (tctx) {
+		if (is_handoff_partner(tctx) && (u32)target < MAX_CPUS)
+			pair_warm_ns[cpu_slot((u32)target)] = now;
+		if (!tctx->wait_since)
+			tctx->wait_since = now;
+		sl = task_slice(tctx, knobs);
+	}
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)target, sl, 0);
+	// THE SEAT RECORDS ITS OWN HAND-OFF. qclock_arrive HERE WAS AN ATOMIC ON
+	// THE SEAT'S CLOCK, ANOTHER CPU'S CACHE LINE, WHICH THAT CPU'S running()
+	// THEN WROTE BACK: TWO LINE TRANSFERS A WAKE, AND montauk's LINE PROFILER
+	// PUT 44 PERCENT OF select_cpu's OWN CYCLES ON THAT ARRIVAL. A HAND-OFF'S
+	// ARRIVAL AND DEPARTURE CANCEL IN THE COUNTS, SO running() WRITES WHAT THE
+	// DEPARTURE WOULD HAVE, THE PROGRESS AND THE SOJOURN, ON ITS OWN LINE. THE
+	// SEAT READS NO WAIT FOR THE MICROSECONDS BETWEEN THE WAKE AND THE RUN
+	// INSTEAD OF THOSE MICROSECONDS, BELOW EVERY BOUND THE PROGRAM COMPARES.
+	if (tctx) {
+		qclock_depart(tctx, now, false);
+		tctx->handoff_seat = (u32)target + 1;
+	}
+	return true;
+}
+
+// WHAT WAKING AN IDLE CPU COSTS A WAKEE, AGAINST WHICH A BUSY WAKER'S SEAT IS
+// PRICED ON THE TIGHT PATH: 2 us, THE SIMULATION THREAD'S MEDIAN WAKE-TO-RUN
+// ON AN IDLE SEAT AT THE FRAME'S JOIN ON THIS BOX (2.06 us), WITH EEVDF'S
+// 1.44 ON THE SAME SEAT BESIDE IT.
+#define WAKER_CORE_WAKE_NS 2000ULL
+
 static __always_inline s32 warm_seat_pick(struct task_struct *p,
 					    struct task_ctx *tctx,
 					    struct tuning_knobs *knobs,
-					    bool is_wakeup, u64 now)
+					    bool is_wakeup)
 {
 	// ADMIT A WAKE, OR A REQUEUED HANDOFF PARTNER, TO THE WARM PER-CPU SEAT.
 	// EVERYTHING ELSE STAYS ON BASELINE. BOTH CALLERS ASK ONLY AFTER PHI'S WALK
@@ -1064,6 +1137,13 @@ static __always_inline s32 warm_seat_pick(struct task_struct *p,
 		return -1;
 	if (p->flags & PF_KTHREAD)
 		return -1;
+	// THE CLOCK IS READ PAST THE THREE REFUSALS ABOVE, WHICH NEED NONE. IT
+	// WAS AN ARGUMENT, READ BEFORE THE CALL, AND select_cpu ASKS ON THE
+	// REQUEUE ARM FOR EVERY WAKE BUT A TASK'S FIRST (runnable(), WHICH CLEARS
+	// ran_since_wake, RUNS AFTER select_cpu), SO EVERY NON-PARTNER WAKE THAT
+	// REACHED THE HOLD THERE, AND EVERY PLAIN REQUEUE PAST TIER 1, PAID A
+	// READ THE FIRST TEST THREW AWAY.
+	u64 now = bpf_ktime_get_ns();
 	// A WAKEUP AND A REQUEUE WANT DIFFERENT ANCHORS.
 	// A WAKEUP HAS NO SEAT AND IS BEING PLACED REGARDLESS, SO IT ANCHORS ON THE
 	// PINNED home_cpu -- A PULL TOWARD A FIXED POINT IS SELF-LIMITING, BECAUSE
@@ -1200,14 +1280,17 @@ static __always_inline s32 find_spill_seat(s32 src_cpu,
 //      PER-CPU DSQ AFFINITY-STRANDING WHEN cpus_ptr CHANGES MID-FLIGHT.
 // *out_cpu RECEIVES THE CPU SCX SHOULD WAKE (THE PER-CPU DSQ OWNER WE
 // LANDED IN; src_cpu IF WE FELL BACK TO domain_inter_dsq).
+// now IS THE CALLER'S CLOCK. THE TIGHT SEAT AND select_cpu's WARM SEAT PASS
+// THE READ THAT STAMPED THE WAIT BASE ONE STORE EARLIER; THE OTHER CALLERS
+// READ IT AT THE CALL.
 static __always_inline u64 pick_pcpu_dsq_with_spill(const struct task_struct *p,
 						    s32 src_cpu,
 						    const struct cpumask *allowed,
 						    bool keep_own,
 						    bool resident_leaving,
+						    u64 now,
 						    s32 *out_cpu)
 {
-	u64 now = bpf_ktime_get_ns();
 	bool src_ok = (u64)src_cpu < nr_cpu_ids &&
 		      (!allowed || bpf_cpumask_test_cpu(src_cpu, allowed));
 	// THE SEAT'S FULL WAIT, ON THE ONE CLOCK: ITS QUEUE'S WAIT PLUS ITS
@@ -1747,12 +1830,13 @@ static __always_inline void update_pair_ledger(struct task_ctx *tctx,
 // IS BOUNDED BY ONE TARGET PLUS THE SINGLE DEMAND THAT MAY OVERSHOOT IT. THE
 // ORDERING DOES NOT HAVE TO ENFORCE WHAT ADMISSION ALREADY BOUNDS, AND A
 // REORDERING CANNOT CHANGE HOW MUCH WORK A WORK-CONSERVING QUEUE COMPLETES.
-static __always_inline u64 task_deadline(struct task_ctx *tctx,
-					 const struct tuning_knobs *knobs)
+// THE CALLER READS THE CLOCK AND PASSES IT, SO THE ONE READ THAT STAMPS
+// THE WAIT BASE ALSO STAMPS THE ARRIVAL WHERE NO PICK STANDS BETWEEN THEM,
+// AND FEEDS THE PICK'S ADMISSION WHERE THE PICK COMES SECOND.
+static __always_inline u64 task_deadline(struct task_ctx *tctx, u64 now)
 {
-	(void)knobs;
 	if (!tctx->wait_since)
-		tctx->wait_since = bpf_ktime_get_ns();
+		tctx->wait_since = now;
 	return tctx->wait_since;
 }
 
@@ -1830,12 +1914,14 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 	// THE SEAT LADDER: A PARTNER'S SYNC HANDOFF TAKES THE WAKER'S CORE, THEN PHI'S
 	// R_eff WALK TAKES THE NEAREST IDLE CPU, AND ONLY WHEN THE WALK FINDS NONE
 	// DOES AN UNCONGESTED HOME HOLD THE WAKEE (warm_seat_pick, BELOW THE WALKS).
-	{
-		struct task_ctx *tc = lookup_task_ctx(p);
-		if (tc) {
-			tc->sync_wake = (wake_flags & SCX_WAKE_SYNC) ? 1 : 0;
-			tc->fanout_wake = fanout_wake(p, wake_flags) ? 1 : 0;
-		}
+	// ONE FETCH OF THE TASK'S CONTEXT FOR THE WHOLE DECISION. IT WAS FETCHED
+	// AGAIN IN EACH BLOCK BELOW, UP TO FOUR bpf_task_storage_get CALLS ON ONE
+	// WAKE; THE KERNEL'S RUN ACCOUNTING READ select_cpu AT 1,445 ns A CALL ON
+	// THE WAKER'S OWN CRITICAL PATH, AND THE REPEATS WERE THE CHEAPEST CUT.
+	struct task_ctx *tctx = lookup_task_ctx(p);
+	if (tctx) {
+		tctx->sync_wake = (wake_flags & SCX_WAKE_SYNC) ? 1 : 0;
+		tctx->fanout_wake = fanout_wake(p, wake_flags) ? 1 : 0;
 	}
 
 	// SET WHEN THE SYNC BLOCK WALKS last_cpu's affinity_rank AND FINDS NO NEAR
@@ -1852,14 +1938,16 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 	// enqueue, LANDS ON A STEALABLE PER-CPU DSQ, AND THE dispatch FLOW STEAL
 	// ROUTES IT BY BACKLOG AND DISTANCE.
 	if (wake_flags & SCX_WAKE_SYNC) {
-		struct task_ctx *tctx = lookup_task_ctx(p);
 		s32 waker_cpu = bpf_get_smp_processor_id();
 		// ONE MAINTAINER FOR THE PAIR LEDGER. enqueue's update_pair_ledger
 		// DOES NOT RUN WHEN select_cpu DISPATCHES, SO THIS PATH ADVANCES IT
 		// THROUGH THE SAME FUNCTION.
+		// THE WAKER IS current. ITS pid IS READ OFF THE TASK, THE SAME VALUE
+		// bpf_get_current_pid_tgid() CARRIED IN ITS LOW WORD, SO THE LEDGER
+		// ADVANCES AS BEFORE; WHERE THE VERIFIER INLINES
+		// bpf_get_current_task_btf() THE HELPER CALL IS GONE.
 		if (tctx)
-			update_pair_ledger(tctx,
-				   (s32)(bpf_get_current_pid_tgid() & 0xffffffff));
+			update_pair_ledger(tctx, bpf_get_current_task_btf()->pid);
 		// PIPE-PARTNER CO-LOCATION. ON A SYNC WAKE THE WAKER IS ABOUT TO BLOCK,
 		// SO ITS CORE FREES IN MICROSECONDS AND WHAT IT JUST PRODUCED IS STILL
 		// CACHE-HOT. FOR A DEMONSTRATED 1:1 PARTNER, SEAT THE WAKEE ON THE
@@ -1878,11 +1966,68 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 		    bpf_cpumask_test_cpu(waker_cpu, p->cpus_ptr)) {
 			struct tuning_knobs *knobs = get_knobs();
 			u64 sl = tctx ? task_slice(tctx, knobs) : 1000000;
-			u64 dl = tctx ? task_deadline(tctx, knobs)
-				      : bpf_ktime_get_ns();
+			// THE WAIT BASE AND THE ADMISSION READ STOOD BACK TO BACK, ONE STORE
+			// APART, SO ONE CLOCK SERVES BOTH. THE ARRIVAL KEEPS ITS OWN READ
+			// AFTER THE INSERT: THE PICK BETWEEN THEM WALKS THE SPILL SEATS WHEN
+			// THE WAKER'S SEAT IS PAST ITS CEILING.
+			u64 now = bpf_ktime_get_ns();
+			// THE WAKER'S CORE, NOT ITS CPU. THE SEAT ABOVE ASSUMES THE WAKER
+			// LEAVES IN MICROSECONDS; A SERVER THAT REPLIES AND KEEPS WORKING
+			// DOES NOT. THE FRAME'S HUB HELD ITS CPU 5.2 us AT THE MEDIAN PAST
+			// EACH OF ITS FOUR REPLIES A FRAME WHILE THE SIMULATION THREAD WAITED
+			// BEHIND IT, AND THE HUB CPU'S SMT SIBLING WAS IDLE AT 98.9 PERCENT
+			// OF THEM: 5.24 us FROM WAKE TO RUN AGAINST EEVDF'S 1.44 ON THAT
+			// SIBLING, ABOUT 12.5 us OF THE SIMULATION THREAD'S FRAME. SO THE
+			// WAKER'S SEAT IS PRICED BY WHAT THE WAKER HAS LEFT OF ITS HABIT
+			// AGAINST WHAT WAKING AN IDLE CPU COSTS, AND WHEN THE
+			// WAKER'S SEAT IS DEARER THE WAKEE TAKES THE WAKER'S IDLE SIBLING:
+			// THE SAME CORE AND CACHES THE CO-LOCATION IS FOR, WITHOUT THE WAIT.
+			// A PIPE PAIR WHOSE WAKER BLOCKS AT ONCE PRICES NEAR ZERO AND KEEPS
+			// THE SEAT BELOW. SLOT 0 OF THE RANK IS THE SMT SIBLING WHERE ITS
+			// R_eff FRACTION IS 0; ON A PART WITHOUT SMT NOTHING CHANGES.
+			{
+				u32 skey = (u32)waker_cpu * MAX_AFFINITY_CANDIDATES;
+				u32 *sib = bpf_map_lookup_elem(&affinity_rank, &skey);
+				u32 *sfr = bpf_map_lookup_elem(&reff_frac, &skey);
+				// THE WAKER IS current, SO WHAT IT HAS LEFT IS READ FROM ITS OWN
+				// CPU'S HABIT SLOTS, NOT THROUGH seat_wait's REMOTE-RESIDENT
+				// PATH: NO HABIT YET, OR PAST IT, READS AS NOT LEAVING, AS THE
+				// GRANTED SLICE WOULD; A QUEUE ALREADY STANDING ON ITS SEAT ADDS.
+				u32 wslot = cpu_slot((u32)waker_cpu);
+				u64 wexp = run_expect_ns[wslot];
+				u64 wran = now > run_start_ns[wslot] ? now - run_start_ns[wslot] : 0;
+				bool waker_stays = !wexp || wran >= wexp ||
+						   wexp - wran > WAKER_CORE_WAKE_NS ||
+						   queue_wait(&pcpu_qclock[wslot], now) > WAKER_CORE_WAKE_NS;
+				if (waker_stays && sib && sfr && *sfr == 0 && *sib < nr_cpu_ids &&
+				    bpf_cpumask_test_cpu(*sib, p->cpus_ptr) &&
+				    scx_bpf_test_and_clear_cpu_idle(*sib)) {
+					s32 sc = (s32)*sib;
+					if (!seat_handoff_fast(p, tctx, sc, knobs)) {
+						// THE CLAIMED SIBLING HAS WORK QUEUED: SEAT BEHIND IT
+						// AND WAKE IT, AS seat_task DOES FOR A WAKE THAT MAY
+						// NOT CUT.
+						u64 sdl = tctx ? task_deadline(tctx, now) : now;
+						scx_bpf_dsq_insert_vtime(p, (u64)sc, sl, sdl, 0);
+						qclock_arrive(tctx, (u64)sc, bpf_ktime_get_ns());
+						scx_bpf_kick_cpu(sc, SCX_KICK_IDLE);
+					}
+					if (tctx)
+						tctx->dispatch_path = 0;
+					struct panda_stats *ss = get_stats();
+					if (ss) {
+						ss->nr_idle_hits += 1;
+						ss->nr_dispatches += 1;
+						cross_domain_bump(ss, XDOM_SEL_TIGHT,
+								  tctx ? tctx->last_cpu : -1, sc);
+					}
+					return sc;
+				}
+			}
+			u64 dl = tctx ? task_deadline(tctx, now) : now;
 			s32 dst_cpu;
 			u64 dst_dsq = pick_pcpu_dsq_with_spill(p, waker_cpu, p->cpus_ptr,
-							       true, true, &dst_cpu);
+							       true, true, now, &dst_cpu);
 			scx_bpf_dsq_insert_vtime(p, dst_dsq, sl, dl, 0);
 			qclock_arrive(tctx, dst_dsq, bpf_ktime_get_ns());
 			// THE KICK IS ASYMMETRIC AND MUST STAY THAT WAY. PREEMPT ONLY WHEN
@@ -1917,26 +2062,29 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 		if ((u64)anchor < nr_cpu_ids) {
 			// PHI PLACEMENT: THE WARM CORE IF IDLE, ELSE THE NEAREST IDLE
 			// PEER IN R_eff ORDER.
-			s32 target = phi_warm_target(anchor, p->cpus_ptr);
+			s32 target = phi_warm_target(anchor, p->cpus_ptr, false);
 			if (target >= 0) {
 				struct tuning_knobs *knobs = get_knobs();
-				u64 sl = tctx ? task_slice(tctx, knobs)
-					      : 1000000;
-				s32 dst_cpu;
-				// PHI DECIDES. THE WALK CLAIMED target'S IDLE BIT, SO target
-				// IS THE SEAT. SEATING ANYWHERE ELSE LEAVES THE CLAIMED CPU
-				// IDLE WITH ITS BIT CLEAR, INVISIBLE TO EVERY LATER WALK
-				// UNTIL IT NEXT RESCHEDULES.
-				u64 dst_dsq = pick_pcpu_dsq_with_spill(p, target, p->cpus_ptr, is_handoff_partner(tctx), false, &dst_cpu);
-				u64 dl = tctx ? task_deadline(tctx, knobs) : bpf_ktime_get_ns();
-				// pick_pcpu_dsq_with_spill CAN REDIRECT dst_cpu OFF THE
-				// VERIFIED-IDLE target ONTO A BUSY SEAT, WHERE SCX_KICK_IDLE
-				// IS A NO-OP: PREEMPT WHEN THE SEAT MOVED AND THE WAKE MAY
-				// CUT, IDLE OTHERWISE.
-				seat_task(p, tctx, dst_cpu, target, dst_dsq, sl, dl,
-					  wake_cuts(tctx),
-					  dst_cpu != target && wake_cuts(tctx)
-						  ? SCX_KICK_PREEMPT : SCX_KICK_IDLE, 0);
+				s32 dst_cpu = target;
+				if (!seat_handoff_fast(p, tctx, target, knobs)) {
+					u64 sl = tctx ? task_slice(tctx, knobs)
+						      : 1000000;
+					// PHI DECIDES. THE WALK CLAIMED target'S IDLE BIT, SO target
+					// IS THE SEAT. SEATING ANYWHERE ELSE LEAVES THE CLAIMED CPU
+					// IDLE WITH ITS BIT CLEAR, INVISIBLE TO EVERY LATER WALK
+					// UNTIL IT NEXT RESCHEDULES.
+					u64 dst_dsq = pick_pcpu_dsq_with_spill(p, target, p->cpus_ptr, is_handoff_partner(tctx), false, bpf_ktime_get_ns(), &dst_cpu);
+					u64 now = bpf_ktime_get_ns();
+					u64 dl = tctx ? task_deadline(tctx, now) : now;
+					// pick_pcpu_dsq_with_spill CAN REDIRECT dst_cpu OFF THE
+					// VERIFIED-IDLE target ONTO A BUSY SEAT, WHERE SCX_KICK_IDLE
+					// IS A NO-OP: PREEMPT WHEN THE SEAT MOVED AND THE WAKE MAY
+					// CUT, IDLE OTHERWISE.
+					seat_task(p, tctx, dst_cpu, target, dst_dsq, sl, dl,
+						  wake_cuts(tctx),
+						  dst_cpu != target && wake_cuts(tctx)
+							  ? SCX_KICK_PREEMPT : SCX_KICK_IDLE, 0, now);
+				}
 				if (tctx) {
 					tctx->dispatch_path = 0;
 				}
@@ -1965,7 +2113,6 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 	// THE WAKEE'S OWN LAST CORE AND SEARCH R_eff-NEAR FIRST. FALLS THROUGH TO dfl
 	// ONLY WHEN NOTHING WARM-NEAR IS IDLE, WHERE enqueue TIER 2 WARM-ANCHORS IT.
 	{
-		struct task_ctx *tctx = lookup_task_ctx(p);
 		// FORK SEED: A FRESHLY FORKED THREAD HAS last_cpu = -1 FROM enable(), SO
 		// IT WOULD SKIP THIS WARM PATH AND TAKE THE NODE-WIDE dfl PICK, WHICH
 		// SCATTERS IT ACROSS THE DOMAIN BOUNDARY. ANCHOR A NEVER-RAN TASK ON
@@ -1978,21 +2125,28 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 			// PHI PLACEMENT: THE WARM CORE IF IDLE, ELSE THE NEAREST IDLE
 			// PEER IN R_eff ORDER. THE CLAIMED target IS THE SEAT, AS ON
 			// THE SYNC PATH ABOVE.
-			s32 target = phi_warm_target(anchor, p->cpus_ptr);
+			// THE ANCHOR PASSED ITS MASK TEST ON ENTRY TO THIS BLOCK, SO THE WALK
+			// DOES NOT ASK IT AGAIN: ONE KFUNC ON EVERY WAKE THAT ENTERS HERE.
+			s32 target = phi_warm_target(anchor, p->cpus_ptr, true);
 			if (target >= 0) {
 				struct tuning_knobs *knobs = get_knobs();
-				u64 sl = task_slice(tctx, knobs);
-				u64 dl = task_deadline(tctx, knobs);
-				s32 seat_cpu;
-				u64 seat_dsq = pick_pcpu_dsq_with_spill(p, target, p->cpus_ptr, is_handoff_partner(tctx), false, &seat_cpu);
-				// THE SPILL CAN SEAT OFF THE VERIFIED-IDLE target ONTO A
-				// BUSY SIBLING: PREEMPT WHEN THE SEAT MOVED AND THE WAKE MAY
-				// CUT, IDLE OTHERWISE, WHICH IS THE WAIT A WAKE THAT MAY NOT
-				// CUT IS GIVEN.
-				seat_task(p, tctx, seat_cpu, target, seat_dsq, sl, dl,
-					  wake_cuts(tctx),
-					  seat_cpu != target && wake_cuts(tctx)
-						  ? SCX_KICK_PREEMPT : SCX_KICK_IDLE, 0);
+				s32 seat_cpu = target;
+				if (!seat_handoff_fast(p, tctx, target, knobs)) {
+					u64 sl = task_slice(tctx, knobs);
+					u64 now = bpf_ktime_get_ns();
+					u64 dl = task_deadline(tctx, now);
+					u64 seat_dsq = pick_pcpu_dsq_with_spill(p, target, p->cpus_ptr, is_handoff_partner(tctx), false, now, &seat_cpu);
+					// THE SPILL CAN SEAT OFF THE VERIFIED-IDLE target ONTO A
+					// BUSY SIBLING: PREEMPT WHEN THE SEAT MOVED AND THE WAKE MAY
+					// CUT, IDLE OTHERWISE, WHICH IS THE WAIT A WAKE THAT MAY NOT
+					// CUT IS GIVEN. THE WAIT BASE AND THE PICK SHARE ONE CLOCK; THE
+					// ARRIVAL IS READ AFTER THE PICK, AS AT THE OTHER SEATS.
+					seat_task(p, tctx, seat_cpu, target, seat_dsq, sl, dl,
+						  wake_cuts(tctx),
+						  seat_cpu != target && wake_cuts(tctx)
+							  ? SCX_KICK_PREEMPT : SCX_KICK_IDLE, 0,
+						  bpf_ktime_get_ns());
+				}
 				tctx->dispatch_path = 0;
 				struct panda_stats *s = get_stats();
 				if (s) {
@@ -2013,10 +2167,8 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 	// PREEMPT-PRICED KICK. THE HOLD COMES BEFORE dfl, WHICH IGNORES DISTANCE AND
 	// WOULD TRADE A WARM HOME FOR ANY IDLE CPU ON THE NODE.
 	{
-		struct task_ctx *tc = lookup_task_ctx(p);
-		s32 hold = warm_seat_pick(p, tc, get_knobs(),
-					  tc && !tc->ran_since_wake,
-					  bpf_ktime_get_ns());
+		s32 hold = warm_seat_pick(p, tctx, get_knobs(),
+					  tctx && !tctx->ran_since_wake);
 		if (hold >= 0)
 			return hold;
 	}
@@ -2025,22 +2177,23 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 	s32 dst_cpu = cpu;
 
 	if (is_idle) {
-		struct task_ctx *tctx = lookup_task_ctx(p);
 		struct tuning_knobs *knobs = get_knobs();
-		u64 sl = tctx ? task_slice(tctx, knobs) : 1000000;
+		if (!seat_handoff_fast(p, tctx, cpu, knobs)) {
+			u64 sl = tctx ? task_slice(tctx, knobs) : 1000000;
 
-		// PER-CPU DSQ PLACEMENT WITH L2/R_EFF SPILL. CACHE-HOT IF cpu
-		// HAS ROOM; SIBLING PER-CPU DSQ NEXT (REACHED BY DISPATCH STEP 0
-		// ON SIBLING OR STEP 1 L2 STEAL); LAST-RESORT domain_inter_dsq.
-		u64 dst_dsq = pick_pcpu_dsq_with_spill(p, cpu, p->cpus_ptr, is_handoff_partner(tctx), false, &dst_cpu);
-		u64 dl = tctx ? task_deadline(tctx, knobs)
-			      : bpf_ktime_get_ns();
-		// `cpu` IS THE VERIFIED-IDLE dfl PICK. THE SPILL CAN REDIRECT dst_cpu
-		// ONTO A BUSY SIBLING: PREEMPT WHEN THE SEAT MOVED AND THE WAKE MAY
-		// CUT, IDLE OTHERWISE.
-		seat_task(p, tctx, dst_cpu, cpu, dst_dsq, sl, dl, wake_cuts(tctx),
-			  dst_cpu != cpu && wake_cuts(tctx)
-				  ? SCX_KICK_PREEMPT : SCX_KICK_IDLE, 0);
+			// PER-CPU DSQ PLACEMENT WITH L2/R_EFF SPILL. CACHE-HOT IF cpu
+			// HAS ROOM; SIBLING PER-CPU DSQ NEXT (REACHED BY DISPATCH STEP 0
+			// ON SIBLING OR STEP 1 L2 STEAL); LAST-RESORT domain_inter_dsq.
+			u64 dst_dsq = pick_pcpu_dsq_with_spill(p, cpu, p->cpus_ptr, is_handoff_partner(tctx), false, bpf_ktime_get_ns(), &dst_cpu);
+			u64 now = bpf_ktime_get_ns();
+			u64 dl = tctx ? task_deadline(tctx, now) : now;
+			// `cpu` IS THE VERIFIED-IDLE dfl PICK. THE SPILL CAN REDIRECT dst_cpu
+			// ONTO A BUSY SIBLING: PREEMPT WHEN THE SEAT MOVED AND THE WAKE MAY
+			// CUT, IDLE OTHERWISE.
+			seat_task(p, tctx, dst_cpu, cpu, dst_dsq, sl, dl, wake_cuts(tctx),
+				  dst_cpu != cpu && wake_cuts(tctx)
+					  ? SCX_KICK_PREEMPT : SCX_KICK_IDLE, 0, now);
+		}
 
 		if (tctx) {
 			tctx->dispatch_path = 0;
@@ -2075,8 +2228,12 @@ s32 BPF_STRUCT_OPS(panda_select_cpu, struct task_struct *p,
 void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 		    u64 enq_flags)
 {
-	s32 node = __COMPAT_scx_bpf_cpu_node(scx_bpf_task_cpu(p));
-	if (node < 0 || (u32)node >= nr_nodes) node = 0;
+	// THE TASK'S CPU CANNOT MOVE WHILE enqueue HOLDS ITS rq, SO IT IS READ
+	// ONCE; TIER 3 READ IT TWICE MORE. ITS NODE FEEDS ONLY THE TWO NODE-WIDE
+	// PICKS AND IS READ AT THE FIRST, WHICH EVERY PATH TO THE SECOND PASSES,
+	// SO A TIER 0 HOLD AND A TIER 1 WALK HIT DO NOT PAY FOR IT.
+	s32 tcpu = scx_bpf_task_cpu(p);
+	s32 node = 0;
 
 	struct task_ctx *tctx = lookup_task_ctx(p);
 
@@ -2090,9 +2247,10 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 	// FLOW SIGNATURE: RECORD THIS WAKEUP'S WAKER CPU IN THE PERSISTED SHAPE
 	// BITMAP (CLASSIFY ONCE BY PARTNER CARDINALITY, FREEZE AT MATURITY). THE
 	// WAKER IS THE ENQUEUEING CPU.
+	// THE WAKER IS current (SCX_OPS_ALLOW_QUEUED_WAKEUP IS OFF); ITS pid IS
+	// READ OFF THE TASK, AS IN select_cpu's SYNC LEDGER.
 	if (tctx && is_wakeup)
-		update_pair_ledger(tctx,
-				   (s32)(bpf_get_current_pid_tgid() & 0xffffffff));
+		update_pair_ledger(tctx, bpf_get_current_task_btf()->pid);
 
 	// A WAKE THAT MAY NOT CUT TAKES AN IDLE CPU (TIER 1) OR THE SHARED DOMAIN
 	// QUEUE (TIER 3), NEVER A BUSY SEAT'S OWN DSQ. ONLY THAT SEAT DRAINS ITS OWN
@@ -2110,7 +2268,7 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 	// THE NODE-WIDE pick_idle_cpu BELOW IS THE FALLBACK WHEN THE WALK MISSES.
 	s32 cpu = -1;
 	if (tctx)
-		cpu = find_idle_by_affinity(tctx->last_cpu, p->cpus_ptr);
+		cpu = find_idle_by_affinity(tctx->last_cpu, p->cpus_ptr, false);
 	if (cpu < 0) {
 		// TIER 0 -- WARM-STAY, REACHED ONLY WHEN PHI'S WALK FOUND NO IDLE CPU.
 		// AN UNCONGESTED HOME KEEPS THE TASK, THE DUAL OF THE DISPATCH STEAL
@@ -2121,11 +2279,13 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 		// LANDS. IT PRECEDES THE NODE-WIDE IDLE PICK, WHICH IGNORES DISTANCE.
 		{
 			s32 hold = wake_waits ? -1
-				 : warm_seat_pick(p, tctx, knobs, is_wakeup,
-						  bpf_ktime_get_ns());
+				 : warm_seat_pick(p, tctx, knobs, is_wakeup);
 			if (hold >= 0) {
-				u64 hdl = task_deadline(tctx, knobs);
+				// ONE CLOCK STAMPS THE WAIT BASE, THE PAIR-WARM MARK AND THE ARRIVAL.
+				// ONLY THE KICK PRICE, WHICH KEEPS ITS OWN READ, AND THE INSERT
+				// STAND BETWEEN THE FIRST STAMP AND THE LAST.
 				u64 hnow = bpf_ktime_get_ns();
+				u64 hdl = task_deadline(tctx, hnow);
 				// PAIR-WARM MARKER: THE WARM-STAY ANCHOR IS A PAIR MEMBER
 				// TAKING ITS SEAT, SO STAMP IT FOR THE STEP-1 PAIR-SPLIT
 				// HOLD, AS THE keep_own SITE DOES.
@@ -2143,7 +2303,7 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 								  SCX_KICK_IDLE);
 				if (seat_task(p, tctx, hold, -1, (u64)hold, sl, hdl,
 					      is_wakeup && wake_cuts(tctx), hold_kick,
-					      enq_flags) == SEAT_CUT)
+					      enq_flags, hnow) == SEAT_CUT)
 					hold_kick = SCX_KICK_PREEMPT;
 				tctx->dispatch_path = 1;
 				struct panda_stats *s = get_stats();
@@ -2168,6 +2328,9 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 				return;
 			}
 		}
+		node = __COMPAT_scx_bpf_cpu_node(tcpu);
+		if (node < 0 || (u32)node >= nr_nodes)
+			node = 0;
 		cpu = __COMPAT_scx_bpf_pick_idle_cpu_node(p->cpus_ptr, node, 0);
 	}
 	if (cpu >= 0 && (u64)cpu < nr_cpu_ids) {
@@ -2178,8 +2341,8 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 		// OF THE TIME. STEP 1's R_eff STEAL STILL RELIEVES THE SEAT IF IT AGES
 		// PAST THE PHI THRESHOLD.
 		u64 tier1_dsq = (u64)cpu;
-		dl = tctx ? task_deadline(tctx, knobs)
-			  : bpf_ktime_get_ns();
+		u64 now = bpf_ktime_get_ns();
+		dl = tctx ? task_deadline(tctx, now) : now;
 
 		// KICK BY THE TARGET'S STATE, NOT BY THE TASK'S CLASS. `cpu` CAME FROM
 		// AN IDLE PICK; IF IT IS STILL IDLE SCX_KICK_IDLE WAKES IT, AND IF IT
@@ -2197,7 +2360,7 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 		u64 kick_flag = requeue_kick_flag(tctx, cpu, is_wakeup, SCX_KICK_IDLE);
 		if (seat_task(p, tctx, cpu, cpu, tier1_dsq, sl, dl,
 			      is_wakeup && wake_cuts(tctx), kick_flag,
-			      enq_flags) == SEAT_CUT)
+			      enq_flags, now) == SEAT_CUT)
 			kick_flag = SCX_KICK_PREEMPT;
 
 		if (tctx) {
@@ -2256,12 +2419,12 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 		cpu = (tctx->last_cpu >= 0 && (u64)tctx->last_cpu < nr_cpu_ids)
 		    ? tctx->last_cpu
 		    : __COMPAT_scx_bpf_pick_any_cpu_node(p->cpus_ptr, node, 0);
-		if (cpu >= 0 && (u64)cpu < nr_cpu_ids &&
-		    __COMPAT_scx_bpf_cpu_curr(cpu)) {
+		if (cpu >= 0 && (u64)cpu < nr_cpu_ids) {
 			s32 t2_cpu;
-			u64 tier2_dsq = pick_pcpu_dsq_with_spill(p, cpu, p->cpus_ptr, is_handoff_partner(tctx), false, &t2_cpu);
+			u64 tier2_dsq = pick_pcpu_dsq_with_spill(p, cpu, p->cpus_ptr, is_handoff_partner(tctx), false, bpf_ktime_get_ns(), &t2_cpu);
 
-			dl = task_deadline(tctx, knobs);
+			u64 now = bpf_ktime_get_ns();
+			dl = task_deadline(tctx, now);
 
 			// THE KICK GOES TO t2_cpu, NOT `cpu` -- THEY DIFFER WHENEVER
 			// THE SPILL FIRES, AND THE HELPER TESTS THE SEAT THAT WILL
@@ -2270,7 +2433,7 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 							  SCX_KICK_IDLE);
 			if (seat_task(p, tctx, t2_cpu, -1, tier2_dsq, sl, dl,
 				      is_wakeup && wake_cuts(tctx), kick_flag,
-				      enq_flags) == SEAT_CUT)
+				      enq_flags, now) == SEAT_CUT)
 				kick_flag = SCX_KICK_PREEMPT;
 			tctx->dispatch_path = 1;
 
@@ -2302,14 +2465,17 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 	// PLUS A SELECTIVE KICK. DISPATCH STEP 3 DRAINS IT DOMAIN-LOCALLY, WHICH IS
 	// CACHE-COHERENT INSIDE THE L3; STEP 5 IS THE CROSS-DOMAIN WORK-CONSERVATION
 	// SCAN WHEN THE LOCAL DOMAIN IS EMPTY.
-	s32 src_cpu_t3 = scx_bpf_task_cpu(p);
+	s32 src_cpu_t3 = tcpu;
 	u32 src_dom_t3 = cpu_domain_of(src_cpu_t3);
 	u64 target_dsq = domain_inter_dsq(src_dom_t3);
 
-	dl = tctx ? task_deadline(tctx, knobs) : bpf_ktime_get_ns();
+	// ONE CLOCK FOR THE WAIT BASE AND THE ARRIVAL; ONLY THE INSERT STANDS
+	// BETWEEN THEM.
+	u64 now = bpf_ktime_get_ns();
+	dl = tctx ? task_deadline(tctx, now) : now;
 
 	scx_bpf_dsq_insert_vtime(p, target_dsq, sl, dl, enq_flags);
-	qclock_arrive(tctx, target_dsq, bpf_ktime_get_ns());
+	qclock_arrive(tctx, target_dsq, now);
 
 #if TRACE_SCHED
 	if (is_sched_task(p))
@@ -2328,7 +2494,7 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 	// A WAKE THAT WAITS TAKES SCX_KICK_IDLE: IT WAKES t3_cpu IF THAT CPU WENT
 	// IDLE AND IS SILENT OTHERWISE. FLAG 0 ON A BUSY CPU ONLY BUYS AN IPI, SINCE
 	// THE KERNEL KEEPS A RESIDENT THAT STILL HAS SLICE.
-	s32 t3_cpu = scx_bpf_task_cpu(p);
+	s32 t3_cpu = tcpu;
 	u64 kick_flags = wake_waits ? SCX_KICK_IDLE
 		       : (is_wakeup || is_handoff_partner(tctx))
 		       ? SCX_KICK_PREEMPT : 0;
@@ -2769,6 +2935,16 @@ void BPF_STRUCT_OPS(panda_running, struct task_struct *p)
 	tctx->ran_since_wake = true;   // is_wakeup = !ran_since_wake
 	tctx->sync_wake = 0;
 	tctx->fanout_wake = 0;
+	if (tctx->handoff_seat) {
+		// A DIRECT HAND-OFF'S SOJOURN, WRITTEN BY THE SEAT (seat_handoff_fast).
+		struct queue_clock *hq = qclock_of((u64)(tctx->handoff_seat - 1));
+		tctx->handoff_seat = 0;
+		if (hq) {
+			hq->progress_ns = now;
+			if (tctx->wait_since && now > tctx->wait_since)
+				hq->last_sojourn_ns = now - tctx->wait_since;
+		}
+	}
 	qclock_depart(tctx, now, true);   // LEFT ITS QUEUE TO RUN -- A SOJOURN
 	tctx->wait_since = 0;          // WAIT ENDED -- RELEASE THE SOJOURN CLAIM
 

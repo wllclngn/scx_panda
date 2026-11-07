@@ -10,15 +10,13 @@ and it can be switched off again at any time with no reboot.
 It descends from [PANDEMONIUM](https://github.com/wllclngn/PANDEMONIUM), by
 the same author, and is measured with PANDEMONIUM's benches.
 
-## What it does
+## About
 
 A scheduler decides which thread runs on which CPU, and for how long, when
 there are more threads than CPUs. scx_panda makes every one of those
 decisions inside the kernel, in a BPF program written in C. A small Rust
 program loads it, measures the machine's cache layout once, hands the program
-a few tables built from that layout, and then gets out of the way.
-
-Three ideas carry it:
+a few tables built from that layout and then gets out of the way.
 
 **Every CPU has its own queue, judged by a clock.** A thread that wakes up is
 seated on one CPU's queue rather than thrown into a shared pile. Each queue
@@ -44,7 +42,7 @@ habit is only ever a number in a sum. Nothing is classified, and no thread is
 sorted into a tier.
 
 Everything else is bookkeeping: The loader fills the tables, refills them if a
-CPU is plugged in or out, prints counters on request, and restarts the program
+CPU is plugged in or out, prints counters on request and restarts the program
 if the kernel asks it to.
 
 ## Requirements
@@ -62,7 +60,7 @@ if the kernel asks it to.
 ```
 
 That builds the program, installs `/usr/local/bin/scx_panda`, writes a
-`scx_panda.service` unit, starts it, and starts it again on every boot. The
+`scx_panda.service` unit, starts it and starts it again on every boot. The
 binary carries the file capabilities it needs to load without running as
 root. Everything else you need:
 
@@ -85,7 +83,7 @@ When it exits it prints a summary and writes the same under
 `/tmp/panda/summary-<time>.txt`; if the kernel ever ejects it, the kernel's
 dump of every queue lands under `/tmp/panda/dump-<time>.txt`.
 
-## Measuring it
+## Test
 
 scx_panda is scored with PANDEMONIUM's prism benches from a checkout of
 PANDEMONIUM in the sibling directory (`PANDEMONIUM_DIR` points elsewhere if
@@ -110,12 +108,12 @@ shipped program on the same benches:
 ```
 
 `measure` installs each arm in turn, runs the frame bench and the scale
-bench on it alone, and prints the results side by side. The arms that exist
+bench on it alone and prints the results side by side. The arms that exist
 today are listed by `./panda.py measure --help`; each one is a single
 compile-time define, named in the binary's version so no run is ever read
 against the wrong program, and none is left installed afterwards.
 
-## scx catalog and export
+## Export
 
 `catalog/profiles.json` carries the profile that scxcli and scxtui can start
 the scheduler by once scx's own build of scx_panda is installed; `panda.py
