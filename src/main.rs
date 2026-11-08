@@ -26,14 +26,9 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 const DUMP_DIR: &str = "/tmp/panda";
 const DUMP_HEAD_LINES: usize = 60;
 
-// THE ARM THIS BINARY WAS BUILT AS: "shipped", OR A MEASUREMENT ARM NAMED BY
-// PANDA_MEASURE AT BUILD TIME. IT RIDES IN THE VERSION, THE BANNER AND THE
-// SUMMARY, SO NO RUN IS READ AGAINST THE WRONG PROGRAM.
-const ARM: &str = env!("PANDA_ARM");
-
 #[derive(Parser)]
 #[command(name = "scx_panda")]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), env!("PANDA_BUILD_ID"), " ", env!("PANDA_TARGET"), " built against ", env!("PANDA_KERNEL"), " arm ", env!("PANDA_ARM")))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), env!("PANDA_BUILD_ID"), " ", env!("PANDA_TARGET"), " built against ", env!("PANDA_KERNEL")))]
 #[command(about = "scx_panda -- a sched_ext scheduler built from discarded ideas and unspent potential")]
 struct Cli {
     /// Print a counter line every second
@@ -62,16 +57,12 @@ fn main() -> Result<()> {
         .unwrap_or(false);
 
     log_info!(
-        "scx_panda {}{} {} arm {} SMT {}",
+        "scx_panda {}{} {} SMT {}",
         env!("CARGO_PKG_VERSION"),
         env!("PANDA_BUILD_ID"),
         env!("PANDA_TARGET"),
-        ARM,
         if smt_on { "on" } else { "off" }
     );
-    if ARM != "shipped" {
-        log_warn!("MEASUREMENT ARM {}: not the shipped program", ARM);
-    }
     log_info!(
         "CPUS: {} (governor: {})",
         nr_cpus,
@@ -156,7 +147,7 @@ fn print_delta(s: &PandaStats, p: &PandaStats, ev: &ScxEvents, pev: &ScxEvents) 
     let used = d(s.nr_seat_expect_used, p.nr_seat_expect_used);
     let over = d(s.nr_seat_expect_overrun, p.nr_seat_expect_overrun);
     println!(
-        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us steal: {:<4} expect: used={} overrun={} sjrn: {}ms{} ev: {}",
+        "d/s: {:<8} idle: {}% shared: {:<6} preempt: {:<4} keep: {:<4} kick: H={:<4} S={:<4} enq: W={:<4} R={:<4} wake: {}us steal: {:<4} lost: {:<4} expect: used={} overrun={} ev: {}",
         disp,
         if disp > 0 { idle * 100 / disp } else { 0 },
         d(s.nr_shared, p.nr_shared),
@@ -168,10 +159,9 @@ fn print_delta(s: &PandaStats, p: &PandaStats, ev: &ScxEvents, pev: &ScxEvents) 
         d(s.nr_enq_requeue, p.nr_enq_requeue),
         wake_us,
         d(s.nr_steal, p.nr_steal),
+        d(s.nr_steal_lost, p.nr_steal_lost),
         used,
         over,
-        s.batch_sojourn_ns / 1_000_000,
-        if s.longrun_mode_active > 0 { " LONGRUN" } else { "" },
         ev.delta_line(pev),
     );
 }
@@ -181,19 +171,21 @@ fn print_delta(s: &PandaStats, p: &PandaStats, ev: &ScxEvents, pev: &ScxEvents) 
 // IS avg_run_ns IN [2^i us, 2^(i+1) us).
 fn print_summary(s: &PandaStats, ev: Option<&ScxEvents>) {
     let x = &s.nr_cross_domain;
-    let scatter: u64 = x[0..6].iter().sum();
+    // EVERY PLACEMENT PATH; THE LAST SLOT IS THE STEAL'S.
+    let scatter: u64 = x[..x.len() - 1].iter().sum();
     let mut lines = vec![format!(
-        "[PANDA] dispatches={} idle_hits={} steal={} spill={} kick_declined={} cross_domain_scatter_pct={} expect_used={} expect_overrun={}",
+        "[PANDA] dispatches={} idle_hits={} steal={} steal_lost={} spill={} kick_declined={} cross_domain_scatter_pct={} expect_used={} expect_overrun={}",
         s.nr_dispatches,
         s.nr_idle_hits,
         s.nr_steal,
+        s.nr_steal_lost,
         s.nr_spill_kick_preempt,
         s.nr_kick_declined,
         if s.nr_dispatches > 0 { scatter * 100 / s.nr_dispatches } else { 0 },
         s.nr_seat_expect_used,
         s.nr_seat_expect_overrun,
     )];
-    lines.push(format!("[PANDA] codel_target_live_ns={}", s.codel_target_live));
+    lines.push(format!("[PANDA] codel_target_live_ns={} rescues={}", s.codel_target_live, s.nr_rescue));
     let total: u64 = s.ewma_hist.iter().sum();
     let cells: Vec<String> = s
         .ewma_hist
@@ -224,14 +216,13 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-// THE SUMMARY UNDER /tmp/panda, HEADED BY THE VERSION AND THE ARM.
+// THE SUMMARY UNDER /tmp/panda, HEADED BY THE VERSION.
 fn write_summary(lines: &[String]) {
     let path = format!("{DUMP_DIR}/summary-{}.txt", epoch_secs());
     let mut body = format!(
-        "scx_panda {}{} arm {} kernel {}\n",
+        "scx_panda {}{} kernel {}\n",
         env!("CARGO_PKG_VERSION"),
         env!("PANDA_BUILD_ID"),
-        ARM,
         env!("PANDA_KERNEL")
     );
     body.push_str(&lines.join("\n"));

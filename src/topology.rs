@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 
-use crate::bpf_intf::MAX_OVERFLOW_DOMAINS;
 use crate::scheduler::Scheduler;
 
 // FIEDLER-VALUE / TOPOLOGY TIME CONSTANT
@@ -295,12 +294,9 @@ impl CpuTopology {
             };
             llc_domain[cpu] = group_id;
         }
-        // MAX_OVERFLOW_DOMAINS mirrors src/bpf/intf.h: the BPF side creates exactly
-        // this many per-domain overflow DSQs. If a (multi-socket, high-cache domain) box has
-        // more L3 groups than that, degrade to the socket domain rather than let
-        // a cache domain id index an uncreated DSQ -> dispatch failure -> ejection.
-        let llc_subdivides = llc_ok && seen_llc.len() > nr_sockets as usize
-            && seen_llc.len() <= MAX_OVERFLOW_DOMAINS as usize;
+        // THE L3 SPLITS THE SOCKET ONLY WHEN THERE ARE MORE L3 GROUPS THAN
+        // SOCKETS; OTHERWISE THE SOCKET IS THE DOMAIN.
+        let llc_subdivides = llc_ok && seen_llc.len() > nr_sockets as usize;
         if !llc_subdivides {
             llc_domain = socket_domain.clone();
         }
@@ -337,8 +333,8 @@ impl CpuTopology {
         let domains = topo.compute_domain_tree();
         topo.log_domains(&domains);
         let domain_phi = topo.domain_cross_phi_matrix(&domains);
-        let ov_domains = topo.overflow_domain_count();
-        let cpu_dom = topo.domain_partition(&domains, ov_domains);
+        let nr_domains = topo.domain_count();
+        let cpu_dom = topo.domain_partition(&domains, nr_domains);
         let dom_peers = topo.min_in_domain_peers(&rank, &cpu_dom);
 
         if let Err(e) = topo.populate_bpf_map(sched) {
@@ -355,12 +351,11 @@ impl CpuTopology {
                 break;
             }
         }
-        log_info!("OVERFLOW DOMAINS: {} (emergent, cpu_domain populated)",
-                         ov_domains);
+        log_info!("DOMAINS: {} (emergent, cpu_domain populated)", nr_domains);
         log_info!("AFFINITY DOMAIN PEERS: {} (min over CPUs; bounds the \
                    idle-search floor)", dom_peers);
         if let Err(e) = sched.write_topo(spectrum.tau_ns, spectrum.codel_eq_ns,
-                                         ov_domains as u32, dom_peers) {
+                                         nr_domains as u32, dom_peers) {
             log_warn!("TOPOLOGY WRITE FAILED: {}", e);
         }
         Ok(spectrum)
@@ -787,20 +782,20 @@ impl CpuTopology {
         }
     }
 
-    // Number of emergent OVERFLOW DOMAINS to target = distinct L3 groups, so
-    // re-keying the overflow DSQs preserves the L3 granularity.
-    pub fn overflow_domain_count(&self) -> usize {
+    // Number of emergent DOMAINS to target = distinct L3 groups, so the
+    // partition keeps the L3 granularity.
+    pub fn domain_count(&self) -> usize {
         let mut v = self.llc_domain.clone();
         v.sort_unstable();
         v.dedup();
         v.len().max(1)
     }
 
-    // T3b.2: partition CPUs into emergent OVERFLOW DOMAINS -- the the discrete domain map
+    // T3b.2: partition CPUs into emergent DOMAINS -- the discrete domain map
     // replacement. Descend the tree from the root, repeatedly splitting the
     // frontier subtree whose cut has the LOWEST phi (the coarsest, most-separable
     // seam) until `target` domains exist or no cut remains. Each resulting subtree
-    // is one overflow domain; dom[cpu] is its id. The granularity is the L3
+    // is one domain; dom[cpu] is its id. The granularity is the L3
     // count; the boundary is drawn by the emergent tree, not the discrete domain map.
     pub fn domain_partition(&self, tree: &DomainNode, target: usize) -> Vec<u32> {
         let mut frontier: Vec<&DomainNode> = vec![tree];
@@ -836,7 +831,7 @@ impl CpuTopology {
 
     // HOW MANY affinity_rank SLOTS STAY INSIDE A CPU'S OWN DOMAIN, MINIMUM OVER
     // CPUs. COUNTED OFF THE SAME rank THE BPF WALK READS AND THE SAME cpu_dom THE
-    // OVERFLOW SITES RE-KEY ON, SO THE BOUND CANNOT DISAGREE WITH THE WALK.
+    // SPILL BOUND READS, SO THE BOUND CANNOT DISAGREE WITH THE WALK.
     //
     // THE PREFIX IS WHAT MATTERS. build_affinity_rank SORTS BY R_eff ASCENDING AND
     // THE CACHE RUNGS ARE ORDERED, SO A CPU'S SAME-DOMAIN PEERS OCCUPY AN UNBROKEN
@@ -982,59 +977,6 @@ impl CpuTopology {
 
     // BUILD PER-CPU AFFINITY RANK: FOR EACH CPU, ALL OTHERS SORTED BY R_EFF
     // Returns flat array: affinity_rank[cpu * nr_cpus + slot] = target_cpu
-    // MEASUREMENT ARM rank-order: THE PREFERRED-CORE RANKING THE FIRMWARE
-    // PUBLISHES, amd_pstate_prefcore_ranking FIRST, THEN acpi_cppc's
-    // highest_perf, THEN cpu_capacity, THEN A FLAT 1 WHERE NONE EXISTS.
-    #[cfg(panda_rank_order)]
-    fn core_rank(nr_cpus: usize) -> Vec<u64> {
-        (0..nr_cpus)
-            .map(|c| {
-                for f in ["cpufreq/amd_pstate_prefcore_ranking", "acpi_cppc/highest_perf", "cpu_capacity"] {
-                    if let Ok(s) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/{f}")) {
-                        if let Ok(v) = s.trim().parse::<u64>() {
-                            return v;
-                        }
-                    }
-                }
-                1
-            })
-            .collect()
-    }
-
-    // MEASUREMENT ARM rank-order: RUNG FIRST (SHARED L2, SHARED L3, SHARED
-    // SOCKET, BEYOND), R_eff WITHIN THE RUNG, THE FASTER CORE AHEAD ON A TIE,
-    // AND EQUIDISTANT PEERS ROTATED SO EACH CPU STARTS ITS WALK AT A DIFFERENT
-    // ONE. THE SAME TABLE AS THE SHIPPED ORDER ON A PART WHERE NONE OF IT
-    // APPLIES.
-    #[cfg(panda_rank_order)]
-    fn build_affinity_rank_ranked(&self, reff: &[f64], n: usize, core: &[u64]) -> Vec<u32> {
-        let mut rank = vec![u32::MAX; n * n];
-        for cpu in 0..n {
-            let mut others: Vec<(u32, u64, std::cmp::Reverse<u64>, usize, u32)> = (0..n)
-                .filter(|&c| c != cpu)
-                .map(|c| {
-                    let rung = if self.l2_domain[cpu] == self.l2_domain[c] {
-                        0
-                    } else if self.llc_domain[cpu] == self.llc_domain[c] {
-                        1
-                    } else if self.socket_domain[cpu] == self.socket_domain[c] {
-                        2
-                    } else {
-                        3
-                    };
-                    let key = (reff[cpu * n + c] * 1_000_000.0) as u64;
-                    (rung, key, std::cmp::Reverse(core.get(c).copied().unwrap_or(1)), (c + n - cpu) % n, c as u32)
-                })
-                .collect();
-            others.sort();
-            for (slot, e) in others.iter().enumerate() {
-                rank[cpu * n + slot] = e.4;
-            }
-        }
-        rank
-    }
-
-    #[cfg_attr(panda_rank_order, allow(dead_code))]
     fn build_affinity_rank(reff: &[f64], n: usize) -> Vec<u32> {
         let mut rank = vec![0u32; n * n];
         for cpu in 0..n {
@@ -1171,10 +1113,7 @@ impl CpuTopology {
                 Self::extract_reff(&l_pinv, n)
             }
         };
-        #[cfg(not(panda_rank_order))]
         let rank = Self::build_affinity_rank(&reff, n);
-        #[cfg(panda_rank_order)]
-        let rank = self.build_affinity_rank_ranked(&reff, n, &Self::core_rank(n));
         let codel_eq_ns = compute_codel_eq_ns(&eigenvalues, n, tau_ns);
         // DISTANCE SCALE: calibrated so the most distant pair (max R_eff)
         // maps to ~tau of required steal-wait, an SMT sibling (R_eff ~ 0) to ~0. Only
@@ -1403,27 +1342,6 @@ mod tests {
         }
     }
 
-    #[cfg(panda_rank_order)]
-    #[test]
-    fn rank_order_leads_each_rung_with_the_fastest_core() {
-        let topo = box_12c();
-        let n = topo.nr_cpus;
-        let (reff, _, _) = topo.compute_resistance_affinity();
-        // CCX0 (CPUs 0..6) RANKS 186/186/181, CCX1 176/171/166, AS THIS BOX DOES.
-        let core: Vec<u64> = (0..n).map(|c| if c % 6 < 3 { [186, 186, 181][c % 3] } else { [176, 171, 166][c % 3] }).collect();
-        let rank = topo.build_affinity_rank_ranked(&reff, n, &core);
-        // SLOT 0 IS STILL THE L2 SIBLING.
-        assert_eq!(topo.l2_domain[rank[0] as usize], topo.l2_domain[0]);
-        // THE FIRST SHARED-L3 PEER OF CPU 0 THAT IS NOT ITS SIBLING IS A 186 CORE.
-        let first_l3 = (0..n).map(|s| rank[s]).find(|&c| topo.l2_domain[c as usize] != topo.l2_domain[0]).unwrap();
-        assert_eq!(core[first_l3 as usize], 186);
-        // EVERY SAME-L3 PEER PRECEDES EVERY CROSS-L3 PEER.
-        let slots: Vec<u32> = (0..n - 1).map(|s| rank[s]).collect();
-        let last_same = slots.iter().rposition(|&c| topo.llc_domain[c as usize] == topo.llc_domain[0]).unwrap();
-        let first_cross = slots.iter().position(|&c| topo.llc_domain[c as usize] != topo.llc_domain[0]).unwrap();
-        assert!(last_same < first_cross);
-    }
-
     #[test]
     fn cpu_list_parses_ranges_and_singles() {
         assert_eq!(parse_cpu_list("0,6"), vec![0, 6]);
@@ -1478,7 +1396,7 @@ mod tests {
     fn domains_follow_the_l3_seam() {
         let t = box_12c();
         let tree = t.compute_domain_tree();
-        assert_eq!(t.overflow_domain_count(), 2);
+        assert_eq!(t.domain_count(), 2);
         let dom = t.domain_partition(&tree, 2);
         assert_eq!(dom.len(), 12);
         for cpu in 0..12 {
@@ -1515,7 +1433,7 @@ mod tests {
         assert_eq!(rank[0], 1);
         assert_eq!(rank[1], u32::MAX);
         assert_eq!(rank[2], 0);
-        assert_eq!(t.overflow_domain_count(), 1);
+        assert_eq!(t.domain_count(), 1);
         assert!(spectrum.tau_ns >= TAU_FLOOR_NS && spectrum.tau_ns <= TAU_CEIL_NS);
     }
 }

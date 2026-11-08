@@ -2,18 +2,16 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (c) 2026 Will Clingan
 """
-measure: the A/B driver for scx_panda's measurement arms.
+measure: the bench driver for this tree's scx_panda.
 
-Installs each named arm in turn, runs PANDEMONIUM's prism benches on it alone
-(scale and frame by default), folds the seat-price counters the arm wrote under
-/tmp/panda, and prints every report's tables side by side. --control adds
-PANDEMONIUM's own two arms from the same evening. The shipped program is
-reinstalled at the end.
+Builds and installs the tree's program once, runs PANDEMONIUM's prism benches on
+it alone (scale and frame by default), folds the seat-price counters it wrote
+under /tmp/panda and prints every report's tables side by side. --control adds
+PANDEMONIUM's own two arms from the same evening.
 
 Usage:
-    ./tests/measure.py [--arms shipped,band-habit,...] [--benches scale,frame]
-                       [--cores 8,12] [--iterations 1] [--scale-iterations 1]
-                       [--control] [--dry-run]
+    ./tests/measure.py [--benches scale,frame] [--cores 8,12] [--iterations 1]
+                       [--scale-iterations 1] [--control] [--dry-run]
     ./tests/measure.py --read REPORT [REPORT ...]
 
 --cores applies to scale; frame runs at native width. Runs as the user.
@@ -35,7 +33,6 @@ PANDEMONIUM_DIR = Path(os.environ.get("PANDEMONIUM_DIR", PANDA_DIR.parent / "PAN
 _HOME = Path(os.path.expanduser(f"~{os.environ['SUDO_USER']}")) if os.environ.get("SUDO_USER") else Path.home()
 REPORT_DIR = _HOME / ".cache" / "pandemonium"
 SUMMARY_DIR = Path("/tmp/panda")
-ARMS = ("shipped", "no-habit-price", "rank-order", "l3-walk")
 BENCHES = ("scale", "frame")
 
 SCALE_METRICS = [
@@ -241,7 +238,7 @@ def print_tables(kind: str, results: list[tuple[str, dict]]) -> None:
 
 
 def read_summaries(since: float) -> tuple[int, int, int]:
-    """(files, expect_used, expect_overrun) over the arm's summaries written since."""
+    """(files, expect_used, expect_overrun) over the summaries written since."""
     files = used = over = 0
     for p in SUMMARY_DIR.glob("summary-*.txt"):
         try:
@@ -271,11 +268,8 @@ def run(cmd: list[str], cwd: Path, dry: bool) -> int:
     return subprocess.run(cmd, cwd=cwd).returncode
 
 
-def install(arm: str, dry: bool) -> bool:
-    cmd = [sys.executable, "panda.py", "install"]
-    if arm != "shipped":
-        cmd += ["--measure", arm]
-    return run(cmd, PANDA_DIR, dry) == 0
+def install(dry: bool) -> bool:
+    return run([sys.executable, "panda.py", "install"], PANDA_DIR, dry) == 0
 
 
 def bench(name: str, extra: list[str], cores: str, iterations: int, dry: bool) -> Path | None:
@@ -299,14 +293,12 @@ def parse(name: str, path: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("--arms", default=",".join(ARMS),
-                    help=f"comma-separated arms to run, each alone (default all): {', '.join(ARMS)}")
     ap.add_argument("--benches", default=",".join(BENCHES),
                     help="comma-separated: scale, frame (default both)")
     ap.add_argument("--cores", default="8,12", help="scale widths (default 8,12)")
-    ap.add_argument("--iterations", type=int, default=1, help="frame iterations per arm")
+    ap.add_argument("--iterations", type=int, default=1, help="frame iterations (default 1)")
     ap.add_argument("--scale-iterations", type=int, default=1,
-                    help="scale iterations per arm; scale is the saturation guard (default 1)")
+                    help="scale iterations; scale is the saturation guard (default 1)")
     ap.add_argument("--control", action="store_true",
                     help="also run PANDEMONIUM's two arms (prism --pandemonium-only)")
     ap.add_argument("--dry-run", action="store_true", help="print the commands only")
@@ -322,12 +314,10 @@ def main() -> int:
                 print_tables(kind, picked)
         return 0
 
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     benches = [b.strip() for b in args.benches.split(",") if b.strip()]
-    unknown = [a for a in arms if a not in ARMS] + [b for b in benches if b not in BENCHES]
+    unknown = [b for b in benches if b not in BENCHES]
     if unknown:
-        log("ERROR", f"unknown: {', '.join(unknown)}; arms are {', '.join(ARMS)}, "
-                     f"benches are {', '.join(BENCHES)}")
+        log("ERROR", f"unknown: {', '.join(unknown)}; benches are {', '.join(BENCHES)}")
         return 2
     if not (PANDEMONIUM_DIR / "pandemonium.py").exists():
         log("ERROR", f"PANDEMONIUM not found at {PANDEMONIUM_DIR} (set PANDEMONIUM_DIR)")
@@ -335,43 +325,34 @@ def main() -> int:
 
     results: dict[str, list[tuple[str, dict]]] = {b: [] for b in benches}
     reports: list[tuple[str, Path]] = []
-    last = None
-    try:
-        for arm in arms:
-            log("INFO", f"arm {arm}: install")
-            if not install(arm, args.dry_run):
-                log("ERROR", f"arm {arm}: install failed")
-                return 1
-            last = arm
-            since = time.time()
-            for b in benches:
-                log("INFO", f"arm {arm}: prism {b}, "
-                            f"{args.scale_iterations if b == 'scale' else args.iterations} iteration(s)"
-                            + (f" at {args.cores} CPUs" if b == "scale" else ""))
-                iters = args.scale_iterations if b == "scale" else args.iterations
-                rep = bench(b, ["--only", "scx_panda"], args.cores, iters, args.dry_run)
-                if rep is None:
-                    if not args.dry_run:
-                        log("WARN", f"arm {arm}: no {b} report found")
-                    continue
-                results[b].append((arm, parse(b, rep)))
-                reports.append((f"{arm} {b}", rep))
-            files, used, over = read_summaries(since)
-            share = f"{100 * over / (used + over):.0f}%" if used + over else "n/a"
-            log("INFO", f"arm {arm}: {files} summaries, expect_used {used}, "
-                        f"expect_overrun {over} (overrun share {share})")
-        if args.control:
-            for b in benches:
-                log("INFO", f"control: PANDEMONIUM's two arms on {b}")
-                iters = args.scale_iterations if b == "scale" else args.iterations
-                rep = bench(b, ["--pandemonium-only"], args.cores, iters, args.dry_run)
-                if rep is not None:
-                    results[b].append(("", parse(b, rep)))
-                    reports.append((f"control {b}", rep))
-    finally:
-        if last not in (None, "shipped"):
-            log("INFO", "restoring the shipped program")
-            install("shipped", args.dry_run)
+    log("INFO", "scx_panda: install")
+    if not install(args.dry_run):
+        log("ERROR", "scx_panda: install failed")
+        return 1
+    since = time.time()
+    for b in benches:
+        iters = args.scale_iterations if b == "scale" else args.iterations
+        log("INFO", f"scx_panda: prism {b}, {iters} iteration(s)"
+                    + (f" at {args.cores} CPUs" if b == "scale" else ""))
+        rep = bench(b, ["--only", "scx_panda"], args.cores, iters, args.dry_run)
+        if rep is None:
+            if not args.dry_run:
+                log("WARN", f"scx_panda: no {b} report found")
+            continue
+        results[b].append(("", parse(b, rep)))
+        reports.append((f"scx_panda {b}", rep))
+    files, used, over = read_summaries(since)
+    share = f"{100 * over / (used + over):.0f}%" if used + over else "n/a"
+    log("INFO", f"scx_panda: {files} summaries, expect_used {used}, "
+                f"expect_overrun {over} (overrun share {share})")
+    if args.control:
+        for b in benches:
+            log("INFO", f"control: PANDEMONIUM's two arms on {b}")
+            iters = args.scale_iterations if b == "scale" else args.iterations
+            rep = bench(b, ["--pandemonium-only"], args.cores, iters, args.dry_run)
+            if rep is not None:
+                results[b].append(("", parse(b, rep)))
+                reports.append((f"control {b}", rep))
 
     for b in benches:
         if results[b]:

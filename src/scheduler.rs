@@ -70,13 +70,12 @@ pub struct PandaStats {
     pub nr_l2_miss_batch: u64,
     pub nr_l2_hit_interactive: u64,
     pub nr_l2_miss_interactive: u64,
-    pub batch_sojourn_ns: u64,
-    pub longrun_mode_active: u64,
-    pub nr_overflow_rescue: u64,
-    pub nr_cross_domain: [u64; 8],
+    pub nr_rescue: u64,
+    pub nr_cross_domain: [u64; 6],
     pub nr_osc_park: u64,
     pub nr_spill_kick_preempt: u64,
     pub nr_steal: u64,
+    pub nr_steal_lost: u64,
     pub nr_kick_declined: u64,
     pub nr_seat_expect_used: u64,
     pub nr_seat_expect_overrun: u64,
@@ -84,8 +83,8 @@ pub struct PandaStats {
     pub codel_target_live: u64,
 }
 
-// 22 SCALARS + 8 (nr_cross_domain) + 6 SCALARS + 16 (ewma_hist) + 1 = 53 u64.
-const _: () = assert!(std::mem::size_of::<PandaStats>() == 53 * 8);
+// 20 SCALARS + 6 (nr_cross_domain) + 7 SCALARS + 16 (ewma_hist) + 1 = 50 u64.
+const _: () = assert!(std::mem::size_of::<PandaStats>() == 50 * 8);
 const _: () = assert!(MAX_AFFINITY_CANDIDATES == MAX_CPUS >> 3);
 
 pub struct Scheduler<'a> {
@@ -226,8 +225,7 @@ impl<'a> Scheduler<'a> {
             .collect()
     }
 
-    // THE FOLD. batch_sojourn_ns AND longrun_mode_active TAKE A MAX ACROSS
-    // CPUs; EVERYTHING ELSE SUMS.
+    // THE FOLD. codel_target_live TAKES A MAX ACROSS CPUs; EVERYTHING ELSE SUMS.
     pub fn fold_stats(percpu: &[PandaStats]) -> PandaStats {
         let mut t = PandaStats::default();
         for s in percpu {
@@ -250,15 +248,14 @@ impl<'a> Scheduler<'a> {
             t.nr_l2_miss_batch += s.nr_l2_miss_batch;
             t.nr_l2_hit_interactive += s.nr_l2_hit_interactive;
             t.nr_l2_miss_interactive += s.nr_l2_miss_interactive;
-            t.batch_sojourn_ns = t.batch_sojourn_ns.max(s.batch_sojourn_ns);
-            t.longrun_mode_active = t.longrun_mode_active.max(s.longrun_mode_active);
-            t.nr_overflow_rescue += s.nr_overflow_rescue;
-            for i in 0..8 {
+            t.nr_rescue += s.nr_rescue;
+            for i in 0..t.nr_cross_domain.len() {
                 t.nr_cross_domain[i] += s.nr_cross_domain[i];
             }
             t.nr_osc_park += s.nr_osc_park;
             t.nr_spill_kick_preempt += s.nr_spill_kick_preempt;
             t.nr_steal += s.nr_steal;
+            t.nr_steal_lost += s.nr_steal_lost;
             t.nr_kick_declined += s.nr_kick_declined;
             t.nr_seat_expect_used += s.nr_seat_expect_used;
             t.nr_seat_expect_overrun += s.nr_seat_expect_overrun;
@@ -313,11 +310,11 @@ impl<'a> Scheduler<'a> {
         &mut self,
         tau_ns: u64,
         codel_eq_ns: u64,
-        nr_overflow_domains: u32,
+        nr_domains: u32,
         affinity_domain_peers: u32,
     ) -> Result<()> {
         let data = self.skel.maps.data_data.as_mut().context("data not mapped")?;
-        data.topo.nr_overflow_domains = nr_overflow_domains;
+        data.topo.nr_domains = nr_domains;
         data.topo.affinity_domain_peers = affinity_domain_peers;
         data.topo.codel_eq_ns = codel_eq_ns;
         data.topo.tau_ns = tau_ns;

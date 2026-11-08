@@ -6,6 +6,4 @@
 
 pub const MAX_CPUS: u32 = 1024;
 pub const MAX_AFFINITY_CANDIDATES: u32 = MAX_CPUS >> 3;
-pub const MAX_NODES: u32 = 32;
-pub const MAX_OVERFLOW_DOMAINS: u32 = 32;
 pub const EWMA_HIST_BUCKETS: usize = 16;

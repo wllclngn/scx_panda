@@ -99,19 +99,19 @@ input threads, with and without background load) with scx_panda as the
 scheduler under test. `prism` passes its arguments through and asks for sudo
 itself.
 
-A change to the scheduler is never judged by eye. It is built as a
-measurement arm, the same program with one lever changed, and run against the
-shipped program on the same benches:
+A change to the scheduler is never judged by eye. The tree's program is
+built, installed and run on the frame bench and the scale bench:
 
 ```
 ./panda.py measure --iterations 3
 ```
 
-`measure` installs each arm in turn, runs the frame bench and the scale
-bench on it alone and prints the results side by side. The arms that exist
-today are listed by `./panda.py measure --help`; each one is a single
-compile-time define, named in the binary's version so no run is ever read
-against the wrong program, and none is left installed afterwards.
+`measure` builds and installs this tree's program, runs both benches on it
+alone and prints their tables. Two programs are compared by interleaving them
+one iteration a round and reading the archives with montauk's population mode
+(`montauk --analyze --group A=one.prom --group B=other.prom ...`), which
+reports each metric's effect size and permutation p-value rather than a mean
+read by eye.
 
 ## Export
 

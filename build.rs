@@ -71,7 +71,7 @@ fn main() {
 
     let gen_include = out_dir.join("include");
     let skel_out = out_dir.join("bpf.skel.rs");
-    let mut cflags: Vec<String> = vec![
+    let cflags: Vec<String> = vec![
         "-I".into(),
         "include".into(),
         "-I".into(),
@@ -79,21 +79,6 @@ fn main() {
         "-I".into(),
         vmlinux_dir.to_str().unwrap().into(),
     ];
-
-    // MEASUREMENT ARMS. PANDA_MEASURE NAMES A COMPILE-TIME ARM OF THE PROGRAM
-    // BUILT FOR AN A/B AND NEVER SHIPPED: THE DEFINE REACHES clang AND THE
-    // ARM'S NAME RIDES IN THE BINARY'S VERSION, BANNER AND SUMMARY.
-    let measure = env::var("PANDA_MEASURE").unwrap_or_default();
-    let (arm, defines): (&str, &[&str]) = match measure.as_str() {
-        "" | "shipped" => ("shipped", &[]),
-        "no-habit-price" => ("no-habit-price", &["-DPANDA_NO_HABIT_PRICE"]),
-        "rank-order" => ("rank-order", &[]),
-        "l3-walk" => ("l3-walk", &["-DPANDA_L3_WALK"]),
-        other => panic!("PANDA_MEASURE={other}: the arms are no-habit-price, rank-order and l3-walk"),
-    };
-    for d in defines {
-        cflags.push((*d).into());
-    }
 
     SkeletonBuilder::new()
         .source(BPF_SRC)
@@ -104,13 +89,6 @@ fn main() {
     println!("cargo:rerun-if-changed={BPF_SRC}");
     println!("cargo:rerun-if-changed=src/bpf/intf.h");
     println!("cargo:rerun-if-changed=include/scx");
-    println!("cargo:rerun-if-env-changed=PANDA_MEASURE");
-    println!("cargo:rustc-env=PANDA_ARM={arm}");
-    // THE LOADER-ONLY ARM IS A RUST cfg, NOT A clang DEFINE.
-    println!("cargo::rustc-check-cfg=cfg(panda_rank_order)");
-    if arm == "rank-order" {
-        println!("cargo:rustc-cfg=panda_rank_order");
-    }
 
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

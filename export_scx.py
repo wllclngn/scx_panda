@@ -24,8 +24,7 @@
 #      IMPORT LANDS IN. catalog/profiles.json STAYS IN THIS TREE FOR AN
 #      ADMINISTRATOR's /etc/scx/catalog.json; scx's CATALOG IS CENTRAL.
 #   2. STRIPS [profile.release] (THE WORKSPACE PROVIDES ITS OWN)
-#   3. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS);
-#      THE MEASUREMENT ARMS STAY IN THIS TREE, THE EXPORT IS THE SHIPPED PROGRAM
+#   3. REPLACES build.rs WITH scx_cargo::BpfBuilder (MATCHES OTHER SCHEDULERS)
 #   4. SWAPS libbpf-cargo FOR THE scx_cargo PATH+VERSION DEP, ADDS scx_utils
 #   5. STRIPS default-features=false FROM libbpf-rs (VENDORED LIBBPF FOR CI)
 #   6. REPLACES THE BUILD-TIME ENUM SHIMS WITH scx_utils::import_enums!, WHICH
@@ -177,11 +176,7 @@ SCX_BUILD_RS = """\
 use std::process::Command;
 
 fn main() {
-    // BUILD ID: GIT SHA, DIRTY FLAG, TARGET TRIPLE. THE EXPORT IS THE SHIPPED
-    // PROGRAM; THE MEASUREMENT ARMS LIVE IN THE STANDALONE TREE. THE LOADER'S
-    // rank-order ARM IS A cfg THE SOURCE STILL NAMES, SO IT IS DECLARED HERE
-    // AS THE STANDALONE build.rs DECLARES IT, AND NEVER SET.
-    println!("cargo::rustc-check-cfg=cfg(panda_rank_order)");
+    // BUILD ID: GIT SHA, DIRTY FLAG, TARGET TRIPLE.
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -211,7 +206,6 @@ fn main() {
     println!("cargo:rustc-env=PANDA_BUILD_ID={}", build_id);
     println!("cargo:rustc-env=PANDA_TARGET={}", target);
     println!("cargo:rustc-env=PANDA_KERNEL=scx vmlinux.h");
-    println!("cargo:rustc-env=PANDA_ARM=shipped");
 
     scx_cargo::BpfBuilder::new()
         .unwrap()

@@ -22,10 +22,6 @@ typedef long long s64;
 // BPF VERIFIER LOOP BOUNDS AND MAP CEILINGS. THE LOADER RESIZES THE TOPOLOGY
 // TABLES TO THE BOX BEFORE LOAD; THESE ARE THE MOST IT MAY ASK FOR.
 #define MAX_CPUS  1024
-#define MAX_NODES 32
-// OVERFLOW-DOMAIN CEILING. DSQs ARE PRE-ALLOCATED AT INIT;
-// topo.nr_overflow_domains GATES WHICH ARE LIVE.
-#define MAX_OVERFLOW_DOMAINS 32
 // PER-CPU affinity_rank SLOT COUNT: MAX_CPUS >> 3 = 128 AT MAX_CPUS=1024.
 // SLOTS PAST nr_cpu_ids - 1 HOLD (u32)-1; LOOPS EARLY-EXIT ON THE SENTINEL.
 #define MAX_AFFINITY_CANDIDATES (MAX_CPUS >> 3)
@@ -39,8 +35,17 @@ struct tuning_knobs {
 	u64 slice_ns;           // BASE TIME SLICE
 	u64 batch_slice_ns;     // STANDING TASK SLICE CEILING
 	u64 codel_thresh_ns;    // tick() PER-CPU SOJOURN SCAN THRESHOLD
-	u64 burst_slice_ns;     // SLICE CEILING DURING LONGRUN
 };
+
+// XDOM PATH INDICES FOR panda_stats.nr_cross_domain[]. THE PRINTER SUMS EVERY
+// SLOT BUT THE LAST, THE STEAL'S, AS THE PLACEMENT SCATTER.
+#define XDOM_SEL_TIGHT   0   // select_cpu sync pipe-partner co-location
+#define XDOM_SEL_SYNC    1   // select_cpu WAKE_SYNC phi_warm_target
+#define XDOM_SEL_NORMAL  2   // select_cpu normal_path phi_warm_target
+#define XDOM_SEL_DFL     3   // select_cpu scx_bpf_select_cpu_dfl idle pick
+#define XDOM_ENQ_T1      4   // enqueue TIER 1 idle (pick_idle_cpu_node)
+#define XDOM_STEAL       5   // dispatch STEP 1 R_eff steal (this_cpu vs peer)
+#define XDOM_PATHS       6
 
 // PER-CPU STATISTICS (BPF_MAP_TYPE_PERCPU_ARRAY VALUE). THE LOADER READS AND
 // FOLDS THEM FOR ITS PRINTER; NOTHING ACTUATES ON THEM.
@@ -53,7 +58,7 @@ struct panda_stats {
 	u64 wake_lat_samples;   // COUNT OF WAKEUP LATENCY SAMPLES
 	u64 nr_keep_running;    // prev KEPT WHEN NOTHING WAS QUEUED
 	u64 nr_hard_kicks;      // ENQUEUE: SCX_KICK_PREEMPT ISSUED
-	u64 nr_soft_kicks;      // ENQUEUE: SCX_KICK_IDLE OR FLAG 0 ISSUED
+	u64 nr_soft_kicks;      // ENQUEUE: SCX_KICK_IDLE ISSUED
 	u64 nr_enq_wakeup;      // ENQUEUE: TASK JUST WOKE UP (!ran_since_wake)
 	u64 nr_enq_requeue;     // ENQUEUE: TASK RE-ENQUEUED (ran_since_wake)
 	u64 wake_lat_idle_sum;  // LATENCY SUM: IDLE FAST PATH (NS)
@@ -66,16 +71,16 @@ struct panda_stats {
 	u64 nr_l2_miss_batch;
 	u64 nr_l2_hit_interactive;
 	u64 nr_l2_miss_interactive;
-	u64 batch_sojourn_ns;   // CURRENT OVERFLOW WAIT AGE (NS), WRITTEN BY tick()
-	u64 longrun_mode_active;// 1 IF SUSTAINED OVERFLOW PRESSURE, WRITTEN BY tick()
-	u64 nr_overflow_rescue; // DISPATCHES BY try_service_aged_overflow AT
-	                        // codel_target_ns
-	// CROSS-DOMAIN LANDINGS BY PLACEMENT PATH, INDEXED BY XDOM_* BELOW.
-	u64 nr_cross_domain[8];
+	u64 nr_rescue;          // DISPATCHES THAT SERVED A LANE PAST codel_target_ns,
+	                        // THE OSCILLATOR'S FORCING TERM
+	// CROSS-DOMAIN LANDINGS BY PLACEMENT PATH, INDEXED BY XDOM_* ABOVE.
+	u64 nr_cross_domain[XDOM_PATHS];
 	u64 nr_osc_park;        // OSCILLATOR ENVELOPE PARK ENTRIES (CPU-0 TICK)
 	u64 nr_spill_kick_preempt; // select_cpu SEATS REDIRECTED OFF AN IDLE PICK
 	                        // ONTO A BUSY SPILL CPU, KICKED SCX_KICK_PREEMPT
 	u64 nr_steal;           // EVERY SUCCESSFUL STEP 1 PEER move_to_local
+	u64 nr_steal_lost;      // STEP 1 MOVES LOST TO ANOTHER THIEF OR THE PEER'S
+	                        // OWN STEP 0; THE WALK WENT ON TO THE NEXT PEER
 	u64 nr_kick_declined;   // requeue_kick_flag RETURNING KICK_NONE,
 	                        // SELF-TARGETED ONLY. NO KFUNC WAS CALLED
 	// THE RUN HABIT'S PRICE AT THE SEAT. used: THE RESIDENT RAN INSIDE ITS HABIT
@@ -89,16 +94,5 @@ struct panda_stats {
 	u64 ewma_hist[16];
 	u64 codel_target_live;   // THE LIVE TARGET, WRITTEN BY CPU 0's TICK; THE BAND EVERY RUN RAN AT
 };
-
-// XDOM PATH INDICES FOR panda_stats.nr_cross_domain[]. POSITIONAL IN THE
-// PRINTER'S OUTPUT: NEVER RENUMBER.
-#define XDOM_SEL_TIGHT   0   // select_cpu sync pipe-partner co-location
-#define XDOM_SEL_SYNC    1   // select_cpu WAKE_SYNC phi_warm_target
-#define XDOM_SEL_NORMAL  2   // select_cpu normal_path phi_warm_target
-#define XDOM_SEL_DFL     3   // select_cpu scx_bpf_select_cpu_dfl idle pick
-#define XDOM_ENQ_T1      4   // enqueue TIER 1 idle (pick_idle_cpu_node)
-#define XDOM_ENQ_T2      5   // enqueue TIER 2 warm-anchor spill
-#define XDOM_STEAL       6   // dispatch STEP 1 R_eff steal (this_cpu vs peer)
-#define XDOM_STEP5       7   // dispatch STEP 5 cross-domain work-conservation
 
 #endif // __INTF_H
