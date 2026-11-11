@@ -11,16 +11,22 @@ PANDEMONIUM's own two arms from the same evening.
 
 Usage:
     ./tests/measure.py [--benches scale,frame] [--cores 8,12] [--iterations 1]
-                       [--scale-iterations 1] [--control] [--dry-run]
+                       [--scale-iterations 1] [--prism-args="FLAGS"]
+                       [--child-args="FLAGS"] [--control] [--dry-run]
     ./tests/measure.py --read REPORT [REPORT ...]
 
---cores applies to scale; frame runs at native width. Runs as the user.
-panda.py and prism ask for sudo where a step needs it.
+--cores applies to scale; frame runs at native width. --child-args reaches
+the bench itself, so one cell runs alone: --child-args="--scenarios contended"
+for frame, --child-args="--ipc" (or --burst, --deadline) for scale.
+--prism-args reaches prism: --prism-args="--trace" records montauk captures.
+Both take their value after an = sign, since the value starts with a dash.
+Runs as the user. panda.py and prism ask for sudo where a step needs it.
 """
 
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -258,6 +264,10 @@ def read_summaries(since: float) -> tuple[int, int, int]:
 def newest_report(bench_name: str, since: float) -> Path | None:
     cands = [p for p in REPORT_DIR.glob(f"prism-{bench_name}-*.log")
              if p.stat().st_mtime >= since]
+    if not cands:
+        # A SCALE CHILD RUN IN ONE MODE NAMES ITS REPORT FOR THE MODE
+        # (prism-ipc, prism-burst, ...), NOT FOR scale.
+        cands = [p for p in REPORT_DIR.glob("prism-*.log") if p.stat().st_mtime >= since]
     return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
 
 
@@ -272,13 +282,17 @@ def install(dry: bool) -> bool:
     return run([sys.executable, "panda.py", "install"], PANDA_DIR, dry) == 0
 
 
-def bench(name: str, extra: list[str], cores: str, iterations: int, dry: bool) -> Path | None:
+def bench(name: str, extra: list[str], cores: str, iterations: int, dry: bool,
+          child: list[str] | None = None) -> Path | None:
     t0 = time.time()
     cmd = [sys.executable, "pandemonium.py", "prism", "--dev", name,
            "--iterations", str(iterations)]
     if name == "scale":
         cmd += ["--cores", cores]
     cmd += extra
+    # THE CHILD'S OWN FLAGS TRAVEL AFTER `--`; EVERYTHING BEFORE IT IS prism's.
+    if child:
+        cmd += ["--", *child]
     rc = run(cmd, PANDEMONIUM_DIR, dry)
     if dry:
         return None
@@ -299,6 +313,13 @@ def main() -> int:
     ap.add_argument("--iterations", type=int, default=1, help="frame iterations (default 1)")
     ap.add_argument("--scale-iterations", type=int, default=1,
                     help="scale iterations; scale is the saturation guard (default 1)")
+    ap.add_argument("--prism-args", default="", metavar="FLAGS",
+                    help="extra prism flags for every bench, written with =, "
+                         "e.g. --prism-args=\"--trace\"")
+    ap.add_argument("--child-args", default="", metavar="FLAGS",
+                    help="flags for the bench child itself, written with =, e.g. "
+                         "--child-args=\"--scenarios contended\" for frame or "
+                         "--child-args=\"--ipc\" for scale")
     ap.add_argument("--control", action="store_true",
                     help="also run PANDEMONIUM's two arms (prism --pandemonium-only)")
     ap.add_argument("--dry-run", action="store_true", help="print the commands only")
@@ -323,6 +344,8 @@ def main() -> int:
         log("ERROR", f"PANDEMONIUM not found at {PANDEMONIUM_DIR} (set PANDEMONIUM_DIR)")
         return 2
 
+    prism_args = shlex.split(args.prism_args)
+    child_args = shlex.split(args.child_args)
     results: dict[str, list[tuple[str, dict]]] = {b: [] for b in benches}
     reports: list[tuple[str, Path]] = []
     log("INFO", "scx_panda: install")
@@ -334,7 +357,8 @@ def main() -> int:
         iters = args.scale_iterations if b == "scale" else args.iterations
         log("INFO", f"scx_panda: prism {b}, {iters} iteration(s)"
                     + (f" at {args.cores} CPUs" if b == "scale" else ""))
-        rep = bench(b, ["--only", "scx_panda"], args.cores, iters, args.dry_run)
+        rep = bench(b, ["--only", "scx_panda", *prism_args], args.cores, iters,
+                    args.dry_run, child_args)
         if rep is None:
             if not args.dry_run:
                 log("WARN", f"scx_panda: no {b} report found")
@@ -349,7 +373,8 @@ def main() -> int:
         for b in benches:
             log("INFO", f"control: PANDEMONIUM's two arms on {b}")
             iters = args.scale_iterations if b == "scale" else args.iterations
-            rep = bench(b, ["--pandemonium-only"], args.cores, iters, args.dry_run)
+            rep = bench(b, ["--pandemonium-only", *prism_args], args.cores, iters,
+                        args.dry_run, child_args)
             if rep is not None:
                 results[b].append(("", parse(b, rep)))
                 reports.append((f"control {b}", rep))

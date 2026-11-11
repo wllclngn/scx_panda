@@ -93,7 +93,7 @@ fn main() -> Result<()> {
 
         // FILL BEFORE ATTACH, SO THE FIRST TICK SEES A FULL TABLE SET AND A
         // LIVE tau. THE SAME SEQUENCE RE-RUNS ON HOTPLUG.
-        let mut last_online = CpuTopology::online_cpu_count();
+        let mut last_online = CpuTopology::online_cpus(nr_cpus as usize);
         if let Err(e) = CpuTopology::detect_and_populate(&mut sched, nr_cpus as usize) {
             log_warn!("TOPOLOGY DETECT FAILED: {}", e);
         }
@@ -174,18 +174,27 @@ fn print_summary(s: &PandaStats, ev: Option<&ScxEvents>) {
     // EVERY PLACEMENT PATH; THE LAST SLOT IS THE STEAL'S.
     let scatter: u64 = x[..x.len() - 1].iter().sum();
     let mut lines = vec![format!(
-        "[PANDA] dispatches={} idle_hits={} steal={} steal_lost={} spill={} kick_declined={} cross_domain_scatter_pct={} expect_used={} expect_overrun={}",
+        "[PANDA] dispatches={} idle_hits={} steal={} steal_lost={} spill={} kick_declined={} cut_reseat={} cross_domain_scatter_pct={} expect_used={} expect_overrun={}",
         s.nr_dispatches,
         s.nr_idle_hits,
         s.nr_steal,
         s.nr_steal_lost,
         s.nr_spill_kick_preempt,
         s.nr_kick_declined,
+        s.nr_cut_reseat,
         if s.nr_dispatches > 0 { scatter * 100 / s.nr_dispatches } else { 0 },
         s.nr_seat_expect_used,
         s.nr_seat_expect_overrun,
     )];
     lines.push(format!("[PANDA] codel_target_live_ns={} rescues={}", s.codel_target_live, s.nr_rescue));
+    // THE STEAL'S REFUSALS, EACH ROW young/price/pair: A HEAD LEFT FOR BEING
+    // YOUNGER THAN THE BASE COST, UNDER THE DISTANCE'S PRICE, OR UNDER THE
+    // PAIR-SPLIT HOLD.
+    let r = &s.nr_steal_refused;
+    lines.push(format!(
+        "[PANDA] steal_refused seat_idle={}/{}/{} seat_busy={}/{}/{} lane_idle={}/{}/{} lane_busy={}/{}/{}",
+        r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10], r[12], r[13], r[14],
+    ));
     let total: u64 = s.ewma_hist.iter().sum();
     let cells: Vec<String> = s
         .ewma_hist

@@ -26,12 +26,12 @@ use crate::scheduler::Scheduler;
 //
 // EXTRACTION IS O(n log n) ON TOP OF THE EXISTING O(n^3) JACOBI.
 // REFERENCE: CHEEGER'S INEQUALITY BOUNDS lambda_2 AGAINST GRAPH BOTTLENECK.
-const LAMBDA_ZERO_EPS: f64 = 1e-8;
+pub const LAMBDA_ZERO_EPS: f64 = 1e-8;
 const TAU_SCALE_NS: f64 = 1.6e8;        // 160MS. CAPACITY-AWARE ANCHOR: AT THE
                                         // 12C REFERENCE (lambda_2=12, N=12)
                                         // tau = 160ms / sqrt(144) = 13.3MS.
-const TAU_FLOOR_NS: u64 = 1_000_000;    //  1MS
-const TAU_CEIL_NS: u64 = 40_000_000;    // 40MS
+pub const TAU_FLOOR_NS: u64 = 1_000_000;    //  1MS
+pub const TAU_CEIL_NS: u64 = 40_000_000;    // 40MS
 
 // THE OSCILLATOR'S WORKING BAND, MIRRORING K_CODEL_FLOOR AND K_CODEL_MAX IN
 // main.bpf.c. c_eq IS A POSITION INSIDE THIS BAND, SO IT NEEDS NO CLAMP OF ITS
@@ -40,11 +40,31 @@ const K_CODEL_FLOOR_Q16: f64 = 1147.0;   // 0.0175 * tau
 const K_CODEL_MAX_Q16:   f64 = 3277.0;   // 0.05   * tau
 const Q16: f64 = 65536.0;
 
+// THE BAND AS apply_tau_scaling() DERIVES IT, (FLOOR, SPAN) IN NS: THE FLOOR
+// IS K_CODEL_FLOOR * tau AND NEVER UNDER CODEL_FLOOR_MIN_NS, AND WHERE THAT
+// RAIL BINDS THE SPAN IS THE RAIL'S AT THE BAND'S OWN RATIO, K_CODEL_MAX OVER
+// K_CODEL_FLOOR. tau FALLS AS THE CPU COUNT RISES, AND ON A LARGE PART THE
+// RAIL IS THE FLOOR: AN EQUILIBRIUM PLACED IN THE UNRAILED BAND LAY UNDER IT
+// AND WAS CLAMPED ONTO THE FLOOR, WHERE THE SPRING PUSHES ONE WAY ONLY.
+fn codel_window(tau_ns: u64) -> (f64, f64) {
+    let floor_ns = (K_CODEL_FLOOR_Q16 / Q16) * tau_ns as f64;
+    let rail_ns = crate::bpf_intf::CODEL_FLOOR_MIN_NS as f64;
+    if floor_ns < rail_ns {
+        (rail_ns, rail_ns * (K_CODEL_MAX_Q16 / K_CODEL_FLOOR_Q16 - 1.0))
+    } else {
+        (floor_ns, ((K_CODEL_MAX_Q16 - K_CODEL_FLOOR_Q16) / Q16) * tau_ns as f64)
+    }
+}
+
+// THE L2, L3, SOCKET AND DOMAIN ID OF AN OFFLINE CPU: ONE NO ONLINE CPU HAS.
+// THE GRAPH IS BUILT OVER THE ONLINE CPUs, SO NOTHING READS IT AS A GROUP.
+pub const OFFLINE_ID: u32 = u32::MAX;
+
 #[derive(Clone, Copy, Debug)]
 pub struct TopologySpectrum {
     pub fiedler: f64,            // lambda_2
     pub tau_ns: u64,             // clamped TAU_SCALE_NS / sqrt(fiedler * N)
-    pub codel_eq_ns: u64,        // A POSITION IN [K_CODEL_FLOOR, K_CODEL_MAX]*tau
+    pub codel_eq_ns: u64,        // A POSITION IN THE BAND codel_window() GIVES,
                                  // SET BY THE SPECTRAL-GAP DEFICIT. NO CLAMP.
     // Phi migration-potential distance->wait scale (Q16). The extra head-wait a
     // steal must clear before crossing to a peer = (reff * this) >> 16 ns. Always
@@ -97,7 +117,7 @@ impl DomainNode {
     }
 }
 
-fn extract_fiedler(eigenvalues: &[f64]) -> f64 {
+pub fn extract_fiedler(eigenvalues: &[f64]) -> f64 {
     // Jacobi RETURNS EIGENVALUES UNSORTED. FOR A CONNECTED LAPLACIAN THE
     // SMALLEST EIGENVALUE IS 0 (SKIPPED VIA LAMBDA_ZERO_EPS). FOR A
     // DISCONNECTED GRAPH (HOTPLUG PARTITION) SEVERAL EIGENVALUES ARE ~0;
@@ -137,8 +157,8 @@ fn compute_tau_ns(fiedler: f64, n: usize) -> u64 {
 //
 // IT IS A POSITION IN THE BAND, NOT A QUANTITY CLAMPED INTO ONE. Tr(L+) >=
 // 1/lambda_2 bounds s at 0 and Tr(L+) <= (N-1)/lambda_2 bounds it at
-// 1 - 1/(N-1), so c_eq lands inside [K_CODEL_FLOOR*tau, K_CODEL_MAX*tau] by
-// construction and main.bpf.c's re-clamp into that same window never fires.
+// 1 - 1/(N-1), so c_eq lands inside the band codel_window() gives, which is
+// the window main.bpf.c derives, and its re-clamp into that window never fires.
 // THAT IS THE POINT: an equilibrium equal to the band's ceiling gives the
 // oscillator a spring that can only push one way.
 //
@@ -147,7 +167,7 @@ fn compute_tau_ns(fiedler: f64, n: usize) -> u64 {
 // be caught as hard as the band allows. An SMT part, where a stiff sibling edge
 // sits beside a weak cross-domain cut, reads s ~0.72 and tolerates longer.
 fn compute_codel_eq_ns(eigenvalues: &[f64], n: usize, tau_ns: u64) -> u64 {
-    let floor_ns = (K_CODEL_FLOOR_Q16 / Q16) * tau_ns as f64;
+    let (floor_ns, _) = codel_window(tau_ns);
     if n < 2 {
         return floor_ns as u64;
     }
@@ -169,13 +189,31 @@ fn compute_codel_eq_ns(eigenvalues: &[f64], n: usize, tau_ns: u64) -> u64 {
     if n_pos == 0 || lambda_2 == f64::MAX || sum_inv_lambda <= 0.0 {
         return floor_ns as u64;
     }
+    codel_eq_at(lambda_2, sum_inv_lambda, n, tau_ns)
+}
+
+// THE SAME POSITION FROM lambda_2 AND Tr(L+) DIRECTLY, FOR THE SOLVER THAT HAS
+// THEM WITHOUT THE REST OF THE SPECTRUM.
+fn codel_eq_at(lambda_2: f64, sum_inv_lambda: f64, n: usize, tau_ns: u64) -> u64 {
+    let (floor_ns, span_ns) = codel_window(tau_ns);
+    if n < 2 || lambda_2 <= 0.0 || sum_inv_lambda <= 0.0 {
+        return floor_ns as u64;
+    }
     let s = (1.0 - lambda_2 * sum_inv_lambda / (n - 1) as f64).clamp(0.0, 1.0);
-    let span_ns = ((K_CODEL_MAX_Q16 - K_CODEL_FLOOR_Q16) / Q16) * tau_ns as f64;
     (floor_ns + span_ns * s) as u64
 }
 
+// THE FOUR PER-SLOT TABLES, AS THE MAPS HOLD THEM. SEE affinity_tables.
+pub struct AffinityTables {
+    pub rank: Vec<u32>,
+    pub value: Vec<u32>,
+    pub frac: Vec<u32>,
+    pub phi: Vec<u32>,
+}
+
 pub struct CpuTopology {
-    pub nr_cpus: usize,
+    pub nr_cpus: usize,           // POSSIBLE CPUs; EVERY PER-CPU TABLE IS INDEXED BY CPU ID
+    pub online: Vec<usize>,       // ONLINE CPU IDS, ASCENDING. THE GRAPH'S VERTICES
     pub l2_domain: Vec<u32>,      // l2_domain[cpu] = group_id
     pub l2_groups: Vec<Vec<u32>>, // l2_groups[group_id] = [cpu, ...]
     pub socket_domain: Vec<u32>,  // socket_domain[cpu] = socket_id
@@ -198,10 +236,17 @@ impl CpuTopology {
         // PASS 1 BUILDS THE REAL GROUPS FROM EVERY SUCCESSFUL READ; PASS 2
         // PLACES THE FAILURES -- JOINING A GROUP THAT ALREADY LISTS THEM, ELSE
         // A REGISTERED SINGLETON GROUP WITH A COLLISION-FREE SEQUENTIAL ID.
-        let mut l2_domain = vec![u32::MAX; nr_cpus];
+        //
+        // ONLY THE ONLINE CPUs ARE READ. AN OFFLINE CPU HAS NO cache OR
+        // topology DIRECTORY IN SYSFS, AND A WIDTH MADE BY TAKING CPUs OFFLINE
+        // (OR SMT DISABLED BY THE KERNEL) LEAVES HALF OF THE POSSIBLE CPUs THAT
+        // WAY: READ FOR EVERY POSSIBLE CPU, THE FIRST MISSING index3 DROPPED
+        // THE L3 SPLIT FOR THE WHOLE MACHINE.
+        let online = Self::online_cpus(nr_cpus);
+        let mut l2_domain = vec![OFFLINE_ID; nr_cpus];
         let mut seen_groups: Vec<Vec<u32>> = Vec::new();
 
-        for cpu in 0..nr_cpus {
+        for &cpu in &online {
             let path = format!(
                 "/sys/devices/system/cpu/cpu{}/cache/index2/shared_cpu_list",
                 cpu
@@ -225,8 +270,8 @@ impl CpuTopology {
 
             l2_domain[cpu] = group_id;
         }
-        for cpu in 0..nr_cpus {
-            if l2_domain[cpu] != u32::MAX {
+        for &cpu in &online {
+            if l2_domain[cpu] != OFFLINE_ID {
                 continue;
             }
             if let Some(id) = seen_groups.iter()
@@ -241,10 +286,10 @@ impl CpuTopology {
         }
 
         // DETECT SOCKET (PHYSICAL PACKAGE)
-        let mut socket_domain = vec![0u32; nr_cpus];
+        let mut socket_domain = vec![OFFLINE_ID; nr_cpus];
         let mut seen_sockets: Vec<u32> = Vec::new();
 
-        for cpu in 0..nr_cpus {
+        for &cpu in &online {
             let path = format!(
                 "/sys/devices/system/cpu/cpu{}/topology/physical_package_id",
                 cpu
@@ -266,12 +311,12 @@ impl CpuTopology {
         // SUBDIVIDES THE SOCKET INTO cache domain GROUPS; ON MONOLITHIC-L3 PARTS IT
         // SPANS THE WHOLE SOCKET. USE THE TIER ONLY WHEN IT GENUINELY
         // SUBDIVIDES A SOCKET (MORE L3 GROUPS THAN SOCKETS) AND index3 WAS
-        // PRESENT FOR EVERY CPU; OTHERWISE llc_domain == socket_domain SO THE
-        // CROSS-DOMAIN RUNG IN build_laplacian NEVER FIRES (EXACT NO-OP).
-        let mut llc_domain = vec![0u32; nr_cpus];
+        // PRESENT FOR EVERY ONLINE CPU; OTHERWISE llc_domain == socket_domain
+        // SO THE CROSS-DOMAIN RUNG IN build_laplacian NEVER FIRES (EXACT NO-OP).
+        let mut llc_domain = vec![OFFLINE_ID; nr_cpus];
         let mut seen_llc: Vec<Vec<u32>> = Vec::new();
         let mut llc_ok = true;
-        for cpu in 0..nr_cpus {
+        for &cpu in &online {
             let path = format!(
                 "/sys/devices/system/cpu/cpu{}/cache/index3/shared_cpu_list",
                 cpu
@@ -303,6 +348,7 @@ impl CpuTopology {
 
         Ok(Self {
             nr_cpus,
+            online,
             l2_domain,
             l2_groups: seen_groups,
             socket_domain,
@@ -311,19 +357,29 @@ impl CpuTopology {
         })
     }
 
-    // ONLINE CPU COUNT, UNPRIVILEGED READ. THE HOTPLUG POLL'S CHANGE SIGNAL.
-    pub fn online_cpu_count() -> usize {
-        std::fs::read_to_string("/sys/devices/system/cpu/online")
-            .map(|s| parse_cpu_list(s.trim()).len())
-            .unwrap_or(0)
+    // THE ONLINE CPUs UNDER nr_cpus, ASCENDING, UNPRIVILEGED READ. None WHEN
+    // THE LIST CANNOT BE READ OR IS EMPTY. THE HOTPLUG POLL'S CHANGE SIGNAL.
+    pub fn read_online(nr_cpus: usize) -> Option<Vec<usize>> {
+        let text = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+        let list: Vec<usize> = parse_cpu_list(text.trim())
+            .into_iter()
+            .map(|c| c as usize)
+            .filter(|&c| c < nr_cpus)
+            .collect();
+        if list.is_empty() { None } else { Some(list) }
+    }
+
+    // THE GRAPH'S VERTICES. AN UNREADABLE LIST FALLS BACK TO EVERY POSSIBLE CPU.
+    pub fn online_cpus(nr_cpus: usize) -> Vec<usize> {
+        Self::read_online(nr_cpus).unwrap_or_else(|| (0..nr_cpus).collect())
     }
 
     // DETECT-AND-POPULATE, THE ONE STARTUP/HOTPLUG SEQUENCE. ALL RUST-SIDE
     // COMPUTATION RUNS BEFORE ANY OF THE MAP WRITES: THERE IS NO CROSS-MAP
     // TRANSACTION PRIMITIVE IN eBPF, SO THE EXPOSURE WHILE MAPS DISAGREE IS
     // BOUNDED BY WRITE TIME ALONE. WRITE ORDER: cache_domain, THE AFFINITY-RANK
-    // FAMILY, cpu_domain, AND topo LAST -- THE "GO" SIGNAL THAT TRIGGERS BPF'S
-    // OWN tau-SCALED RE-DERIVATION.
+    // FAMILY, cpu_domain, AND topo LAST, ITS GENERATION LAST OF ALL -- THE "GO"
+    // SIGNAL THAT TRIGGERS BPF'S OWN RE-DERIVATION OF EVERYTHING topo FEEDS.
     pub fn detect_and_populate(sched: &mut Scheduler, nr_cpus: usize)
                                -> Result<TopologySpectrum> {
         let topo = Self::detect(nr_cpus)?;
@@ -337,19 +393,17 @@ impl CpuTopology {
         let cpu_dom = topo.domain_partition(&domains, nr_domains);
         let dom_peers = topo.min_in_domain_peers(&rank, &cpu_dom);
 
-        if let Err(e) = topo.populate_bpf_map(sched) {
+        let tables = topo.affinity_tables(&reff, &rank, spectrum.phi_dist_scale_q16,
+                                          spectrum.codel_eq_ns, &domain_phi);
+
+        if let Err(e) = sched.write_cache_domains(&topo.l2_domain) {
             log_warn!("CACHE TOPOLOGY MAP WRITE FAILED: {}", e);
         }
-        if let Err(e) = topo.populate_affinity_rank_map(
-            sched, &reff, &rank, spectrum.phi_dist_scale_q16,
-            spectrum.codel_eq_ns, &domain_phi) {
+        if let Err(e) = sched.write_affinity_tables(&tables) {
             log_warn!("AFFINITY RANK MAP WRITE FAILED: {}", e);
         }
-        for (cpu, &d) in cpu_dom.iter().enumerate() {
-            if let Err(e) = sched.write_cpu_domain(cpu as u32, d) {
-                log_warn!("CPU DOMAIN MAP WRITE FAILED (cpu {}): {}", cpu, e);
-                break;
-            }
+        if let Err(e) = sched.write_cpu_domains(&cpu_dom) {
+            log_warn!("CPU DOMAIN MAP WRITE FAILED: {}", e);
         }
         log_info!("DOMAINS: {} (emergent, cpu_domain populated)", nr_domains);
         log_info!("AFFINITY DOMAIN PEERS: {} (min over CPUs; bounds the \
@@ -361,33 +415,24 @@ impl CpuTopology {
         Ok(spectrum)
     }
 
-    // HOTPLUG POLL, THE ONE IMPLEMENTATION: compare the online-CPU count
-    // against the last observed value; on change, log and re-run the full
-    // detect-and-populate so a CPU broken at boot (the L2 singleton fallback)
-    // self-corrects once real sysfs data exists, and every R_eff/phi/domain
-    // table tracks the live width. Called each tick by BOTH control loops.
-    // Returns true when it fired -- the adaptive loop keys its tau refresh on it.
+    // HOTPLUG POLL: COMPARE THE ONLINE CPU LIST AGAINST THE LAST ONE SEEN, AND
+    // ON A CHANGE RE-RUN THE WHOLE DETECT-AND-POPULATE, SO EVERY R_eff, phi AND
+    // DOMAIN TABLE TRACKS THE LIVE SET. THE LIST AND NOT ITS LENGTH: ONE CPU
+    // GOING DOWN AS ANOTHER COMES UP INSIDE A POLL LEAVES THE COUNT WHERE IT WAS.
+    // RETURNS TRUE WHEN IT FIRED.
     pub fn poll_hotplug(sched: &mut Scheduler, nr_cpus: usize,
-                        last_online: &mut usize) -> bool {
-        let now = Self::online_cpu_count();
-        if now == 0 || now == *last_online {
+                        last_online: &mut Vec<usize>) -> bool {
+        let Some(now) = Self::read_online(nr_cpus) else { return false };
+        if now == *last_online {
             return false;
         }
         log_info!("HOTPLUG: online CPUs {} -> {} -- re-deriving topology",
-                         *last_online, now);
+                         last_online.len(), now.len());
         *last_online = now;
         if let Err(e) = Self::detect_and_populate(sched, nr_cpus) {
             log_warn!("HOTPLUG TOPOLOGY RE-DETECT FAILED: {}", e);
         }
         true
-    }
-
-    // WRITE THE L2 DOMAIN MAP.
-    pub fn populate_bpf_map(&self, sched: &mut Scheduler) -> Result<()> {
-        for cpu in 0..self.nr_cpus {
-            sched.write_cache_domain(cpu as u32, self.l2_domain[cpu])?;
-        }
-        Ok(())
     }
 
     // RESISTANCE AFFINITY. EFFECTIVE RESISTANCE R_eff(u,v) IS THE MIGRATION COST
@@ -407,7 +452,8 @@ impl CpuTopology {
     // CROSS-L3 CUT STAYS 1.0 AND tau AND codel_eq ARE UNCHANGED. ON A MONOLITHIC
     // PART THE L3 RUNG COINCIDES WITH THE SOCKET RUNG.
     //
-    // O(n^3) FOR n CPUs, WHICH IS TRIVIAL AT STARTUP FOR n <= 256.
+    // THE EIGENSOLVE SERVES UP TO WALK_CUT_THRESHOLD CPUs AND ONE CHOLESKY
+    // FACTOR, O(n^3), THE PARTS PAST IT.
     // REFERENCE: RESISTANCE DISTANCE IS KLEIN AND RANDIC (J. MATH. CHEM.
     //            1993); ALGEBRAIC CONNECTIVITY AND ITS EIGENVECTOR ARE
     //            FIEDLER (CZECH. MATH. J. 1973); THE SOLVERS FOLLOW
@@ -468,12 +514,27 @@ impl CpuTopology {
         }
     }
 
-    fn build_laplacian(&self) -> Vec<f64> {
-        let n = self.nr_cpus;
+    // m x m OVER THE ONLINE CPUs: ROW AND COLUMN k ARE CPU online[k].
+    // THE CACHE RUNG TWO CPUs SHARE, NEAREST FIRST: 0 AN L2, 1 AN L3, 2 A
+    // SOCKET, 3 NOTHING. THE SAME LADDER conductance() PRICES.
+    fn rung(&self, i: usize, j: usize) -> u8 {
+        if self.l2_domain[i] == self.l2_domain[j] {
+            0
+        } else if self.llc_domain[i] == self.llc_domain[j] {
+            1
+        } else if self.socket_domain[i] == self.socket_domain[j] {
+            2
+        } else {
+            3
+        }
+    }
+
+    pub fn build_laplacian(&self) -> Vec<f64> {
+        let n = self.online.len();
         let mut l = vec![0.0f64; n * n];
         for i in 0..n {
             for j in (i + 1)..n {
-                let w = self.conductance(i, j);
+                let w = self.conductance(self.online[i], self.online[j]);
                 l[i * n + j] = -w;
                 l[j * n + i] = -w;
                 l[i * n + i] += w;
@@ -587,9 +648,11 @@ impl CpuTopology {
         Some((side_a, side_b, best_phi))
     }
 
-    // Below this many CPUs the exact eigen cut is cheap, so use it; above it,
-    // the O(n^3) Jacobi is the wall and the random-walk cut takes over. This is an
-    // implementation dispatch on cost, not a placement gate (THE FLAG untouched).
+    // Up to this many CPUs the Jacobi eigensolve is cheap, so the exact eigen
+    // cut and the eigen pseudoinverse use it; above it classical Jacobi, about
+    // O(n^4) with its pivot search, is the wall, and the random-walk cut and the
+    // factored pseudoinverse take over. This is an implementation dispatch on
+    // cost, not a placement gate (THE FLAG untouched).
     const WALK_CUT_THRESHOLD: usize = 64;
 
     // SCALABLE min-conductance cut: the SAME sweep as domain_cut, but the vertex
@@ -679,11 +742,28 @@ impl CpuTopology {
         let f: Vec<f64> = (0..k).map(|i| y[i] * dis[i]).collect();
         let mut order: Vec<usize> = (0..k).collect();
         order.sort_by(|&a, &b| f[a].partial_cmp(&f[b]).unwrap_or(std::cmp::Ordering::Equal));
-        let mut in_side = vec![false; self.nr_cpus];
+        // THE SAME phi AS cut_conductance, CARRIED FROM ONE PREFIX TO THE NEXT:
+        // MOVING v ACROSS ADDS ITS EDGES INTO THE FAR SIDE TO THE CUT, TAKES ITS
+        // EDGES INTO THE NEAR SIDE OUT, AND MOVES ITS DEGREE BETWEEN THE VOLUMES.
+        // O(k) A PREFIX WHERE THE FULL RECOUNT IS O(k^2), WHICH AT 1,024 CPUs IS
+        // A BILLION EDGE READS FOR THE FIRST CUT ALONE.
+        let mut near = vec![false; k];
+        let (mut cut, mut vol_a) = (0.0f64, 0.0f64);
+        let mut vol_b: f64 = deg.iter().sum();
         let (mut best_phi, mut best_k) = (f64::INFINITY, 1usize);
         for s in 1..k {
-            in_side[members[order[s - 1]]] = true;
-            let phi = self.cut_conductance(members, &in_side);
+            let v = order[s - 1];
+            let row = &adj[v * k..v * k + k];
+            for u in 0..k {
+                if u != v {
+                    if near[u] { cut -= row[u] } else { cut += row[u] }
+                }
+            }
+            near[v] = true;
+            vol_a += deg[v];
+            vol_b -= deg[v];
+            let denom = vol_a.min(vol_b);
+            let phi = if denom <= 0.0 { f64::INFINITY } else { cut / denom };
             if phi < best_phi {
                 best_phi = phi;
                 best_k = s;
@@ -728,7 +808,7 @@ impl CpuTopology {
     // hierarchy from which T3's bounded-local steal reads its locality clusters
     // and per-cut crossing prices. Public: the T2 -> T3 hand-off point.
     pub fn compute_domain_tree(&self) -> DomainNode {
-        self.build_domain_tree(&(0..self.nr_cpus).collect::<Vec<_>>())
+        self.build_domain_tree(&self.online)
     }
 
     // Log the emergent domains at boot -- observability that the tree the steal
@@ -782,10 +862,10 @@ impl CpuTopology {
         }
     }
 
-    // Number of emergent DOMAINS to target = distinct L3 groups, so the
-    // partition keeps the L3 granularity.
+    // Number of emergent DOMAINS to target = distinct L3 groups over the online
+    // CPUs, so the partition keeps the L3 granularity.
     pub fn domain_count(&self) -> usize {
-        let mut v = self.llc_domain.clone();
+        let mut v: Vec<u32> = self.online.iter().map(|&c| self.llc_domain[c]).collect();
         v.sort_unstable();
         v.dedup();
         v.len().max(1)
@@ -797,6 +877,8 @@ impl CpuTopology {
     // seam) until `target` domains exist or no cut remains. Each resulting subtree
     // is one domain; dom[cpu] is its id. The granularity is the L3
     // count; the boundary is drawn by the emergent tree, not the discrete domain map.
+    // An offline CPU is in no leaf and keeps OFFLINE_ID: every BPF use of a
+    // domain id is an equality test, so it matches no online CPU's.
     pub fn domain_partition(&self, tree: &DomainNode, target: usize) -> Vec<u32> {
         let mut frontier: Vec<&DomainNode> = vec![tree];
         while frontier.len() < target.max(1) {
@@ -816,7 +898,7 @@ impl CpuTopology {
             }
         }
         let n = self.nr_cpus;
-        let mut dom = vec![0u32; n];
+        let mut dom = vec![OFFLINE_ID; n];
         for (id, node) in frontier.iter().enumerate() {
             for leaf in node.leaves() {
                 for c in leaf {
@@ -824,6 +906,32 @@ impl CpuTopology {
                         dom[c] = id as u32;
                     }
                 }
+            }
+        }
+        // THE CUT'S DOMAINS ARE THE L3 GROUPS WHEREVER THE CUT CAN SEE THEM, AND
+        // IT CANNOT SEE AN UNBALANCED ONE: phi DIVIDES BY THE SMALLER SIDE'S
+        // VOLUME, SO AN L3 WITH ONE CPU ONLINE CUTS AT phi 1.0, THE WORST A CUT
+        // CAN READ, AND THE TREE SPLITS A WHOLE L3 INSTEAD (4 OF THE REFERENCE
+        // BOX'S 12: {0,2} AND {1,3} AT 0.8 FOR THE L3s {0,1,2} AND {3}). THE
+        // RANK ORDERS BY THE CACHE RUNG AND THE SPILL IS BOUNDED BY THE DOMAIN,
+        // SO A PARTITION THAT LEAVES THE L3 SEAM IS REPLACED BY THE L3 GROUPS.
+        let follows_seam = self.online.iter().all(|&a| {
+            self.online.iter().all(|&b| {
+                (dom[a] == dom[b]) == (self.llc_domain[a] == self.llc_domain[b])
+            })
+        });
+        if !follows_seam && target > 1 {
+            let mut seen: Vec<u32> = Vec::new();
+            for &c in &self.online {
+                let llc = self.llc_domain[c];
+                let id = match seen.iter().position(|&g| g == llc) {
+                    Some(id) => id,
+                    None => {
+                        seen.push(llc);
+                        seen.len() - 1
+                    }
+                };
+                dom[c] = id as u32;
             }
         }
         dom
@@ -847,16 +955,20 @@ impl CpuTopology {
     // WOULD DRAG EVERY OTHER CPU'S FLOOR TO 1 TO EXPRESS A CONSTRAINT THAT CANNOT
     // HELP IT. THE SINGLETON FALLS THROUGH TO THE dfl PICK INSTEAD.
     // RETURNS 1 ONLY WHEN NO CPU HAS A PEER.
+    //
+    // THE ROW AS STORED: THE TABLE KEEPS MAX_AFFINITY_CANDIDATES SLOTS A CPU,
+    // AND A DOMAIN WIDER THAN THAT IS COUNTED TO THE TABLE'S EDGE, NOT PAST IT.
     pub fn min_in_domain_peers(&self, rank: &[u32], cpu_dom: &[u32]) -> u32 {
         let n = self.nr_cpus;
         if n < 2 || rank.len() < n * n || cpu_dom.len() < n {
             return 1;
         }
+        let stored = (n - 1).min(crate::bpf_intf::MAX_AFFINITY_CANDIDATES as usize);
         let mut min_peers = u32::MAX;
-        for cpu in 0..n {
+        for &cpu in &self.online {
             let home = cpu_dom[cpu];
             let mut peers = 0u32;
-            for slot in 0..(n - 1) {
+            for slot in 0..stored {
                 let target = rank[cpu * n + slot] as usize;
                 if target >= n || cpu_dom[target] != home {
                     break;
@@ -872,8 +984,8 @@ impl CpuTopology {
 
     // SYMMETRIC EIGENDECOMPOSITION VIA JACOBI ROTATIONS
     // RETURNS (eigenvalues, eigenvectors_column_major)
-    // SUITABLE FOR n <= 256. NO EXTERNAL DEPENDENCIES.
-    fn symmetric_eigen(mat: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    // CALLED FOR n <= WALK_CUT_THRESHOLD. NO EXTERNAL DEPENDENCIES.
+    pub fn symmetric_eigen(mat: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
         let mut a = mat.to_vec();
         // EIGENVECTORS START AS IDENTITY
         let mut v = vec![0.0f64; n * n];
@@ -944,7 +1056,7 @@ impl CpuTopology {
     }
 
     // COMPUTE LAPLACIAN PSEUDOINVERSE FROM EIGENDECOMPOSITION
-    fn compute_pseudoinverse(eigenvalues: &[f64], eigenvectors: &[f64], n: usize) -> Vec<f64> {
+    pub fn compute_pseudoinverse(eigenvalues: &[f64], eigenvectors: &[f64], n: usize) -> Vec<f64> {
         let mut l_pinv = vec![0.0f64; n * n];
         for k in 0..n {
             if eigenvalues[k].abs() < 1e-8 {
@@ -963,7 +1075,7 @@ impl CpuTopology {
 
     // COMPUTE ALL-PAIRS EFFECTIVE RESISTANCE FROM PSEUDOINVERSE
     // R_eff(i,j) = L+[i,i] + L+[j,j] - 2*L+[i,j]
-    fn extract_reff(l_pinv: &[f64], n: usize) -> Vec<f64> {
+    pub fn extract_reff(l_pinv: &[f64], n: usize) -> Vec<f64> {
         let mut r = vec![0.0f64; n * n];
         for i in 0..n {
             for j in (i + 1)..n {
@@ -975,26 +1087,35 @@ impl CpuTopology {
         r
     }
 
-    // BUILD PER-CPU AFFINITY RANK: FOR EACH CPU, ALL OTHERS SORTED BY R_EFF
+    // BUILD PER-CPU AFFINITY RANK: FOR EACH ONLINE CPU, EVERY OTHER ONLINE CPU
+    // SORTED BY THE CACHE RUNG THE PAIR SHARES AND, INSIDE A RUNG, BY R_EFF,
+    // THE ROW COMPACTED: ITS PEERS FIRST, THEN THE SENTINEL. AN OFFLINE CPU IS
+    // IN NO ROW AND ITS OWN ROW IS ALL SENTINEL, SO A WALK SPENDS NO SLOT AND
+    // NO BUDGET ON A CPU THAT CANNOT RUN ANYTHING.
+    //
+    // THE RUNG LEADS BECAUSE R_eff ALONE ORDERS BY IT ONLY ON A SYMMETRIC
+    // GRAPH. R_eff(i, j) LEANS ON 1/deg(i) + 1/deg(j), AND THE STIFF L2 EDGE
+    // GIVES A CPU WITH AN ONLINE SIBLING SEVENTY TO NINETY TIMES THE DEGREE OF
+    // ONE WITHOUT: AT 8 OF THE REFERENCE BOX'S 12 CPUs, CPU 3 READS THE OTHER L3'S
+    // FOUR SIBLING-BEARING CPUs AT 0.1312 AND ITS OWN L3'S TWO AT 0.1429, AND
+    // SORTED BY R_eff ALONE ITS OWN CACHE CAME LAST BUT ONE. WHERE EVERY CORE
+    // HAS THE SAME THREADS ONLINE THE TWO ORDERS ARE THE SAME ORDER.
     // Returns flat array: affinity_rank[cpu * nr_cpus + slot] = target_cpu
-    fn build_affinity_rank(reff: &[f64], n: usize) -> Vec<u32> {
-        let mut rank = vec![0u32; n * n];
-        for cpu in 0..n {
-            let mut others: Vec<(u64, u32)> = (0..n)
-                .filter(|&c| c != cpu)
-                .map(|c| {
+    fn build_affinity_rank(&self, reff: &[f64]) -> Vec<u32> {
+        let n = self.nr_cpus;
+        let mut rank = vec![u32::MAX; n * n];
+        for &cpu in &self.online {
+            let mut others: Vec<(u8, u64, u32)> = self.online.iter()
+                .filter(|&&c| c != cpu)
+                .map(|&c| {
                     // SORT KEY: R_EFF AS FIXED-POINT TO AVOID FLOAT COMPARISON ISSUES
                     let key = (reff[cpu * n + c] * 1_000_000.0) as u64;
-                    (key, c as u32)
+                    (self.rung(cpu, c), key, c as u32)
                 })
                 .collect();
             others.sort();
-            for (slot, &(_, target)) in others.iter().enumerate() {
+            for (slot, &(_, _, target)) in others.iter().enumerate() {
                 rank[cpu * n + slot] = target;
-            }
-            // FILL REMAINING SLOTS WITH SENTINEL
-            for slot in others.len()..n {
-                rank[cpu * n + slot] = u32::MAX;
             }
         }
         rank
@@ -1003,15 +1124,16 @@ impl CpuTopology {
     // INTEGER LAPLACIAN FROM THE ICOND_* RUNG TABLE (SPILL-Phi). SAME EDGE
     // STRUCTURE AS build_laplacian, INTEGER WEIGHTS.
     fn build_laplacian_int(&self) -> Vec<i128> {
-        let n = self.nr_cpus;
+        let n = self.online.len();
         let mut l = vec![0i128; n * n];
         for i in 0..n {
             for j in (i + 1)..n {
-                let w = if self.l2_domain[i] == self.l2_domain[j] {
+                let (a, b) = (self.online[i], self.online[j]);
+                let w = if self.l2_domain[a] == self.l2_domain[b] {
                     Self::ICOND_L2
-                } else if self.llc_domain[i] == self.llc_domain[j] {
+                } else if self.llc_domain[a] == self.llc_domain[b] {
                     Self::ICOND_LLC
-                } else if self.socket_domain[i] == self.socket_domain[j] {
+                } else if self.socket_domain[a] == self.socket_domain[b] {
                     Self::ICOND_SOCKET
                 } else {
                     Self::ICOND_CROSS
@@ -1090,31 +1212,162 @@ impl CpuTopology {
         Some(r)
     }
 
+    // THE LAPLACIAN PSEUDOINVERSE WITHOUT AN EIGENSOLVE. ON A CONNECTED GRAPH
+    // L + J/n IS POSITIVE DEFINITE (J THE ALL-ONES MATRIX: IT FILLS THE ONE
+    // DIRECTION L HAS NO STIFFNESS IN) AND ITS INVERSE IS L+ + J/n, SO ONE
+    // CHOLESKY FACTOR AND ITS INVERSE GIVE L+ IN O(n^3) WHERE JACOBI'S
+    // ROTATIONS, EACH BEHIND A FULL PIVOT SEARCH, RUN TO ABOUT O(n^4). EVERY
+    // INNER PRODUCT WALKS TWO ROWS, NEVER A COLUMN. None WHEN A PIVOT IS NOT
+    // POSITIVE, WHICH A CONNECTED LAPLACIAN CANNOT GIVE; THE CALLER FALLS BACK
+    // TO THE EIGENSOLVE.
+    pub fn pseudoinverse_by_factor(lap: &[f64], n: usize) -> Option<Vec<f64>> {
+        let shift = 1.0 / n as f64;
+        // CHOLESKY: l LOWER TRIANGULAR, l * l^T = L + J/n.
+        let mut l = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = lap[i * n + j] + shift;
+                for k in 0..j {
+                    sum -= l[i * n + k] * l[j * n + k];
+                }
+                if i == j {
+                    if sum <= 0.0 || !sum.is_finite() {
+                        return None;
+                    }
+                    l[i * n + i] = sum.sqrt();
+                } else {
+                    l[i * n + j] = sum / l[j * n + j];
+                }
+            }
+        }
+        // u = (l^-1)^T, UPPER TRIANGULAR, ROW BY ROW.
+        let mut u = vec![0.0f64; n * n];
+        for j in 0..n {
+            u[j * n + j] = 1.0 / l[j * n + j];
+            for i in (j + 1)..n {
+                let mut sum = 0.0;
+                for k in j..i {
+                    sum -= l[i * n + k] * u[j * n + k];
+                }
+                u[j * n + i] = sum / l[i * n + i];
+            }
+        }
+        // (L + J/n)^-1 = u * u^T, AND L+ IS THAT LESS J/n.
+        let mut pinv = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = 0.0;
+                for k in i..n {
+                    sum += u[i * n + k] * u[j * n + k];
+                }
+                pinv[i * n + j] = sum - shift;
+                pinv[j * n + i] = sum - shift;
+            }
+        }
+        Some(pinv)
+    }
+
+    // lambda_2 FROM L+: ITS LARGEST EIGENVALUE IS 1/lambda_2, AND POWER
+    // ITERATION FINDS IT AT O(n^2) A STEP. THE CONSTANT VECTOR IS L+'S NULL
+    // DIRECTION AND IS PROJECTED OUT EACH STEP AGAINST ROUNDING. A REPEATED
+    // lambda_2, WHICH EVERY SYMMETRIC PART WITH MORE THAN TWO L3s HAS, STILL
+    // CONVERGES: THE ITERATE SETTLES SOMEWHERE IN THE EIGENSPACE AND THE
+    // RAYLEIGH QUOTIENT IS THE SAME EVERYWHERE IN IT. DETERMINISTIC START.
+    pub fn fiedler_from_pseudoinverse(pinv: &[f64], n: usize) -> f64 {
+        if n < 2 {
+            return LAMBDA_ZERO_EPS;
+        }
+        let center = |v: &mut [f64]| {
+            let mean = v.iter().sum::<f64>() / n as f64;
+            for x in v.iter_mut() {
+                *x -= mean;
+            }
+        };
+        let mut y: Vec<f64> = (0..n)
+            .map(|i| {
+                let h = (i as u64).wrapping_mul(2654435761) & 0xffff;
+                h as f64 / 65535.0 - 0.5
+            })
+            .collect();
+        center(&mut y);
+        let mut w = vec![0.0f64; n];
+        let mut mu = 0.0f64;
+        for _ in 0..10_000 {
+            let norm = y.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm < 1e-300 {
+                break;
+            }
+            for x in y.iter_mut() {
+                *x /= norm;
+            }
+            for i in 0..n {
+                let row = &pinv[i * n..i * n + n];
+                w[i] = row.iter().zip(&y).map(|(a, b)| a * b).sum();
+            }
+            center(&mut w);
+            let next: f64 = w.iter().zip(&y).map(|(a, b)| a * b).sum();
+            let settled = (next - mu).abs() <= 1e-14 * next.abs();
+            mu = next;
+            std::mem::swap(&mut y, &mut w);
+            if settled {
+                break;
+            }
+        }
+        if mu > 0.0 { 1.0 / mu } else { LAMBDA_ZERO_EPS }
+    }
+
     // COMPUTE RESISTANCE AFFINITY: FULL PIPELINE
     // Returns (reff_matrix, affinity_rank, spectrum) for use by BPF and scheduler.
     // Spectrum carries lambda_2 (Fiedler value) and its derived tau_ns, used as
     // the universal topology time constant for every core-scaled knob.
+    //
+    // THE GRAPH IS THE ONLINE CPUs: m OF THEM, AND EVERY SPECTRAL QUANTITY
+    // (lambda_2, tau, codel_eq, R_eff) IS THAT GRAPH'S. THE R_eff MATRIX AND THE
+    // RANK COME BACK INDEXED BY CPU ID, nr_cpus x nr_cpus, AN OFFLINE CPU'S ROW
+    // AND COLUMN ZERO IN THE ONE AND SENTINEL IN THE OTHER.
     pub fn compute_resistance_affinity(&self) -> (Vec<f64>, Vec<u32>, TopologySpectrum) {
         let n = self.nr_cpus;
+        let m = self.online.len();
         let laplacian = self.build_laplacian();
-        let (eigenvalues, eigenvectors) = Self::symmetric_eigen(&laplacian, n);
-        let fiedler = extract_fiedler(&eigenvalues);
-        let tau_ns = compute_tau_ns(fiedler, n);
-        // EXACT INTEGER R_eff (Bareiss spanning-2-forest / spanning-tree determinant
-        // ratio) where i128 holds it; else the float pseudoinverse. Same rung
-        // ratios both paths, so downstream is unchanged either way.
-        let reff: Vec<f64> = match (n <= Self::REFF_EXACT_MAX_CPUS)
-            .then(|| Self::reff_from_int_laplacian(&self.build_laplacian_int(), n))
-            .flatten()
-        {
-            Some(r) => r.into_iter().map(|x| x * Self::ICOND_RECOVER).collect(),
-            None => {
-                let l_pinv = Self::compute_pseudoinverse(&eigenvalues, &eigenvectors, n);
-                Self::extract_reff(&l_pinv, n)
-            }
+        // PAST THE EIGENSOLVE'S REACH THE PSEUDOINVERSE COMES FROM ONE FACTOR,
+        // AND lambda_2 AND Tr(L+), ALL THE SPECTRUM tau AND codel_eq READ, FROM
+        // IT. A FACTOR THAT FAILS FALLS BACK TO THE EIGENSOLVE.
+        let factored = (m > Self::WALK_CUT_THRESHOLD)
+            .then(|| Self::pseudoinverse_by_factor(&laplacian, m))
+            .flatten();
+        let (fiedler, tau_ns, codel_eq_ns, graph_reff) = if let Some(l_pinv) = factored {
+            let fiedler = Self::fiedler_from_pseudoinverse(&l_pinv, m);
+            let tau_ns = compute_tau_ns(fiedler, m);
+            let trace: f64 = (0..m).map(|i| l_pinv[i * m + i]).sum();
+            let codel_eq_ns = codel_eq_at(fiedler, trace, m, tau_ns);
+            (fiedler, tau_ns, codel_eq_ns, Self::extract_reff(&l_pinv, m))
+        } else {
+            let (eigenvalues, eigenvectors) = Self::symmetric_eigen(&laplacian, m);
+            let fiedler = extract_fiedler(&eigenvalues);
+            let tau_ns = compute_tau_ns(fiedler, m);
+            // EXACT INTEGER R_eff (Bareiss spanning-2-forest / spanning-tree determinant
+            // ratio) where i128 holds it; else the float pseudoinverse. Same rung
+            // ratios both paths, so downstream is unchanged either way.
+            let graph_reff: Vec<f64> = match (m <= Self::REFF_EXACT_MAX_CPUS)
+                .then(|| Self::reff_from_int_laplacian(&self.build_laplacian_int(), m))
+                .flatten()
+            {
+                Some(r) => r.into_iter().map(|x| x * Self::ICOND_RECOVER).collect(),
+                None => {
+                    let l_pinv = Self::compute_pseudoinverse(&eigenvalues, &eigenvectors, m);
+                    Self::extract_reff(&l_pinv, m)
+                }
+            };
+            let codel_eq_ns = compute_codel_eq_ns(&eigenvalues, m, tau_ns);
+            (fiedler, tau_ns, codel_eq_ns, graph_reff)
         };
-        let rank = Self::build_affinity_rank(&reff, n);
-        let codel_eq_ns = compute_codel_eq_ns(&eigenvalues, n, tau_ns);
+        let mut reff = vec![0.0f64; n * n];
+        for (a, &i) in self.online.iter().enumerate() {
+            for (b, &j) in self.online.iter().enumerate() {
+                reff[i * n + j] = graph_reff[a * m + b];
+            }
+        }
+        let rank = self.build_affinity_rank(&reff);
         // DISTANCE SCALE: calibrated so the most distant pair (max R_eff)
         // maps to ~tau of required steal-wait, an SMT sibling (R_eff ~ 0) to ~0. Only
         // sustained backlog (~tau) justifies a far move; a single queued slice does
@@ -1129,34 +1382,39 @@ impl CpuTopology {
         (reff, rank, TopologySpectrum { fiedler, tau_ns, codel_eq_ns, phi_dist_scale_q16 })
     }
 
-    // WRITE AFFINITY RANK TO BPF MAP
-    // affinity_rank[cpu * MAX_AFFINITY_CANDIDATES + slot] = target_cpu
-    //
-    // Emit the full sorted R_eff peer list per CPU, capped at the BPF
-    // table width (MAX_AFFINITY_CANDIDATES). Slots beyond the actual
-    // topology end (nr_cpus - 1) are written as explicit u32::MAX
-    // sentinels so the BPF early-exit fires correctly -- map zero-init
-    // would otherwise alias to "CPU 0" and silently mis-route.
-    pub fn populate_affinity_rank_map(
+    // THE FOUR TABLES THE BPF WALKS READ, EACH nr_cpus * MAX_AFFINITY_CANDIDATES
+    // AND PAIRED 1:1 ON cpu * MAX_AFFINITY_CANDIDATES + slot:
+    //   rank   THE TARGET CPU, R_eff ASCENDING
+    //   value  THE STEAL'S DISTANCE PENALTY TO IT, NS
+    //   frac   R_eff TO IT AS A Q16 FRACTION OF THE MACHINE'S SPAN
+    //   phi    THE EMERGENT-DOMAIN CROSSING PRICE TO IT
+    // A ROW HOLDS ITS CPU'S ONLINE PEERS, CAPPED AT THE TABLE'S WIDTH, AND THEN
+    // THE SENTINEL IN ALL FOUR, WRITTEN EXPLICITLY: A ZERO-FILLED SLOT WOULD
+    // READ AS CPU 0. AN OFFLINE CPU'S ROW IS ALL SENTINEL.
+    pub fn affinity_tables(
         &self,
-        sched: &Scheduler,
         reff: &[f64],
         rank: &[u32],
         phi_dist_scale_q16: u64,
         codel_eq_ns: u64,
         domain_phi: &[u32],
-    ) -> Result<()> {
+    ) -> AffinityTables {
         let stride = crate::bpf_intf::MAX_AFFINITY_CANDIDATES as usize;
-        let valid = self.nr_cpus.saturating_sub(1).min(stride);
-        // R_eff's SPAN ACROSS DISTINCT PAIRS, FOR THE DIMENSIONLESS EMIT BELOW. A
-        // distance prices only its excess over the nearest pair on the machine:
-        // the nearest peer is free, the most distant pair is 65536, and a
-        // topology whose pairs are all equidistant (2C on one L3) prices nothing.
-        // The diagonal is excluded -- R_eff(i, i) is 0 and is no peer.
         let n = self.nr_cpus;
+        let mut t = AffinityTables {
+            rank: vec![u32::MAX; n * stride],
+            value: vec![u32::MAX; n * stride],
+            frac: vec![u32::MAX; n * stride],
+            phi: vec![u32::MAX; n * stride],
+        };
+        // R_eff's SPAN ACROSS DISTINCT ONLINE PAIRS, FOR THE DIMENSIONLESS EMIT
+        // BELOW. A distance prices only its excess over the nearest pair on the
+        // machine: the nearest peer is free, the most distant pair is 65536, and
+        // a topology whose pairs are all equidistant (2C on one L3) prices
+        // nothing. The diagonal is excluded -- R_eff(i, i) is 0 and is no peer.
         let (mut rmin, mut rmax) = (f64::MAX, 0.0f64);
-        for i in 0..n {
-            for j in 0..n {
+        for &i in &self.online {
+            for &j in &self.online {
                 if i != j {
                     let r = reff[i * n + j];
                     rmin = rmin.min(r);
@@ -1167,26 +1425,24 @@ impl CpuTopology {
         let to_scaled = |r: f64| (r * 1_000_000.0).round().clamp(0.0, u32::MAX as f64) as u64;
         let reff_floor = if rmin == f64::MAX { 0 } else { to_scaled(rmin) };
         let reff_span = to_scaled(rmax).saturating_sub(reff_floor);
-        for cpu in 0..self.nr_cpus {
-            for slot in 0..valid {
-                let val = rank[cpu * self.nr_cpus + slot];
-                sched.write_affinity_rank(cpu as u32, slot as u32, val)?;
+        for &cpu in &self.online {
+            for slot in 0..n.saturating_sub(1).min(stride) {
+                let val = rank[cpu * n + slot];
+                if val as usize >= n {
+                    break;
+                }
+                let at = cpu * stride + slot;
+                t.rank[at] = val;
                 // T3b.1: the emergent-domain crossing price to this ranked peer,
-                // 1:1 with the rank slot (sentinel for an out-of-range peer id).
+                // 1:1 with the rank slot.
                 // IF phi_dist_scale_q16 IS 0 (tau UNSET; ITS FLOOR PREVENTS IT) THE STEAL
                 // DOES NO R_eff DISTANCE PRICING; MAKE THE CROSSING PRICE
                 // SENTINEL TOO SO THE STEAL-SIDE PAIR-SPLIT HOLD IS A NO-OP,
                 // MATCHING reff_value's FLAT codel_target BASELINE (THE STEAL
                 // IS domain_phi's CONSUMER).
-                let dphi = if phi_dist_scale_q16 == 0 {
-                    u32::MAX
-                } else {
-                    domain_phi
-                        .get(cpu * self.nr_cpus + val as usize)
-                        .copied()
-                        .unwrap_or(u32::MAX)
-                };
-                sched.write_domain_phi(cpu as u32, slot as u32, dphi)?;
+                if phi_dist_scale_q16 != 0 {
+                    t.phi[at] = domain_phi[cpu * n + val as usize];
+                }
                 // FOLD THE PHI DISTANCE PENALTY AT INIT: reff_value stores the
                 // final steal extra-wait in ns, (R_eff * phi_dist_scale_q16) >> 16,
                 // so the BPF steal does one indexed read and no multiply. The 1e6
@@ -1200,18 +1456,15 @@ impl CpuTopology {
                 // per-peer price that must reach ~0 for a genuinely near peer (an
                 // SMT sibling stays freely relievable), and STEP 1's phi_thresh
                 // already adds the uniform codel_target_ns base on top.
-                let r_scaled = (reff[cpu * self.nr_cpus + val as usize] * 1_000_000.0)
-                    .round()
-                    .clamp(0.0, u32::MAX as f64) as u64;
+                let r_scaled = to_scaled(reff[cpu * n + val as usize]);
                 let raw_extra = r_scaled.saturating_mul(phi_dist_scale_q16) >> 16;
-                let dist_extra = if phi_dist_scale_q16 == 0 {
+                t.value[at] = if phi_dist_scale_q16 == 0 {
                     0
                 } else {
                     raw_extra
                         .min(codel_eq_ns.saturating_mul(2))
                         .min(u32::MAX as u64) as u32
                 };
-                sched.write_reff_value(cpu as u32, slot as u32, dist_extra)?;
                 // THE SAME R_eff SHAPE, WITH NO TIME UNIT ON IT. reff_value folds
                 // the distance against TAU because that is the steal's question:
                 // only sustained backlog (~tau) justifies a far pull. The wake-path
@@ -1224,21 +1477,14 @@ impl CpuTopology {
                 // what stops slot 0 changing rung from moving a threshold 42x. The
                 // nearest pair is 0, so a distance only ever prices how much
                 // farther a peer is than the nearest one could have been.
-                let frac_q16 = if phi_dist_scale_q16 == 0 || reff_span == 0 {
+                t.frac[at] = if phi_dist_scale_q16 == 0 || reff_span == 0 {
                     0u32
                 } else {
                     ((r_scaled.saturating_sub(reff_floor) << 16) / reff_span).min(65536) as u32
                 };
-                sched.write_reff_frac(cpu as u32, slot as u32, frac_q16)?;
-            }
-            for slot in valid..stride {
-                sched.write_affinity_rank(cpu as u32, slot as u32, u32::MAX)?;
-                sched.write_reff_value(cpu as u32, slot as u32, u32::MAX)?;
-                sched.write_reff_frac(cpu as u32, slot as u32, u32::MAX)?;
-                sched.write_domain_phi(cpu as u32, slot as u32, u32::MAX)?;
             }
         }
-        Ok(())
+        t
     }
 
     pub fn log_resistance_affinity(
@@ -1254,25 +1500,31 @@ impl CpuTopology {
             spectrum.codel_eq_ns / 1_000
         );
         let n = self.nr_cpus;
-        // LOG TOP 3 AFFINITIES FOR CPU 0
+        let m = self.online.len();
+        let Some(&c0) = self.online.first() else { return };
+        // LOG TOP 3 AFFINITIES FOR THE FIRST ONLINE CPU
         let mut parts = Vec::new();
-        for slot in 0..3.min(n - 1) {
-            let target = rank[slot] as usize;
+        for slot in 0..3.min(m - 1) {
+            let target = rank[c0 * n + slot] as usize;
             if target >= n { break; }
-            let r = reff[target];
+            let r = reff[c0 * n + target];
             parts.push(format!("CPU{}(R={:.3})", target, r));
         }
-        log_info!("RESISTANCE AFFINITY: CPU 0 rank: {}", parts.join(", "));
+        log_info!("RESISTANCE AFFINITY: CPU {} rank: {}", c0, parts.join(", "));
 
-        // LOG L2 VS NON-L2 R_EFF FOR FIRST CPU
-        if n >= 2 {
-            let l2_sib = rank[0] as usize;
-            let non_l2 = rank[1.min(n - 2)] as usize;
+        // LOG L2 VS NON-L2 R_EFF FOR THE FIRST ONLINE CPU
+        if m >= 2 {
+            let l2_sib = rank[c0 * n] as usize;
+            let non_l2 = rank[c0 * n + 1.min(m - 2)] as usize;
             log_info!(
                 "RESISTANCE AFFINITY: R_eff L2={:.4} non-L2={:.4} ratio={:.1}x",
-                reff[l2_sib],
-                reff[non_l2],
-                if reff[l2_sib] > 0.0 { reff[non_l2] / reff[l2_sib] } else { 0.0 }
+                reff[c0 * n + l2_sib],
+                reff[c0 * n + non_l2],
+                if reff[c0 * n + l2_sib] > 0.0 {
+                    reff[c0 * n + non_l2] / reff[c0 * n + l2_sib]
+                } else {
+                    0.0
+                }
             );
         }
     }
@@ -1283,12 +1535,13 @@ impl CpuTopology {
             log_info!("L2 GROUP {}: [{}]", gid, cpus.join(","));
         }
         log_info!(
-            "L2 GROUPS: {} across {} CPUs, {} SOCKETS",
+            "L2 GROUPS: {} across {} ONLINE CPUs OF {}, {} SOCKETS",
             self.l2_groups.len(),
+            self.online.len(),
             self.nr_cpus,
             self.nr_sockets
         );
-        let mut llc = self.llc_domain.clone();
+        let mut llc: Vec<u32> = self.online.iter().map(|&c| self.llc_domain[c]).collect();
         llc.sort_unstable();
         llc.dedup();
         log_info!(
@@ -1299,7 +1552,7 @@ impl CpuTopology {
 }
 
 // PARSE KERNEL CPU LIST FORMAT: "0,6" or "0-2,6-8" or "3"
-fn parse_cpu_list(s: &str) -> Vec<u32> {
+pub fn parse_cpu_list(s: &str) -> Vec<u32> {
     let mut result = Vec::new();
     for part in s.split(',') {
         let part = part.trim();
@@ -1319,121 +1572,4 @@ fn parse_cpu_list(s: &str) -> Vec<u32> {
     result.sort();
     result.dedup();
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // THE 12C REFERENCE: SIX SMT PAIRS {c, c+6}, TWO L3 DOMAINS OF THREE CORES,
-    // ONE SOCKET.
-    fn box_12c() -> CpuTopology {
-        let n = 12;
-        let l2_domain: Vec<u32> = (0..n).map(|c| (c % 6) as u32).collect();
-        let l2_groups: Vec<Vec<u32>> = (0..6).map(|g| vec![g as u32, g as u32 + 6]).collect();
-        let llc_domain: Vec<u32> = (0..n).map(|c| if c % 6 < 3 { 0 } else { 1 }).collect();
-        CpuTopology {
-            nr_cpus: n,
-            l2_domain,
-            l2_groups,
-            socket_domain: vec![0; n],
-            llc_domain,
-            nr_sockets: 1,
-        }
-    }
-
-    #[test]
-    fn cpu_list_parses_ranges_and_singles() {
-        assert_eq!(parse_cpu_list("0,6"), vec![0, 6]);
-        assert_eq!(parse_cpu_list("0-2,6-8"), vec![0, 1, 2, 6, 7, 8]);
-        assert_eq!(parse_cpu_list("3"), vec![3]);
-        assert_eq!(parse_cpu_list("8-8,1,1"), vec![1, 8]);
-        assert!(parse_cpu_list("").is_empty());
-    }
-
-    #[test]
-    fn reference_box_tau_and_equilibrium() {
-        let t = box_12c();
-        let (reff, rank, spectrum) = t.compute_resistance_affinity();
-        assert_eq!(reff.len(), 144);
-        assert_eq!(rank.len(), 144);
-        // tau = 160ms / sqrt(lambda_2 * N); lambda_2 = 12 on this graph.
-        assert!(spectrum.fiedler > 11.9 && spectrum.fiedler < 12.1, "lambda_2 {}", spectrum.fiedler);
-        assert!(spectrum.tau_ns > 13_000_000 && spectrum.tau_ns < 13_700_000, "tau {}", spectrum.tau_ns);
-        let floor = (K_CODEL_FLOOR_Q16 / Q16) * spectrum.tau_ns as f64;
-        let max = (K_CODEL_MAX_Q16 / Q16) * spectrum.tau_ns as f64;
-        let eq = spectrum.codel_eq_ns as f64;
-        assert!(eq >= floor - 1.0 && eq <= max + 1.0, "codel_eq {} outside [{}, {}]", eq, floor, max);
-    }
-
-    #[test]
-    fn effective_resistance_is_a_metric_with_three_rungs() {
-        let t = box_12c();
-        let (reff, rank, _) = t.compute_resistance_affinity();
-        let n = 12;
-        for i in 0..n {
-            assert_eq!(reff[i * n + i], 0.0);
-            for j in 0..n {
-                assert!((reff[i * n + j] - reff[j * n + i]).abs() < 1e-9);
-                for k in 0..n {
-                    assert!(reff[i * n + j] <= reff[i * n + k] + reff[k * n + j] + 1e-9);
-                }
-            }
-        }
-        // SLOT 0 OF EVERY RANK IS THE SMT SIBLING, THE NEAREST RUNG.
-        for cpu in 0..n {
-            assert_eq!(rank[cpu * n], ((cpu + 6) % 12) as u32, "cpu {} slot 0", cpu);
-            assert_eq!(rank[cpu * n + n - 1], u32::MAX, "cpu {} sentinel", cpu);
-        }
-        // SAME-L3 PEERS PRECEDE EVERY CROSS-L3 PEER.
-        let smt = reff[0 * n + 6];
-        let same_l3 = reff[0 * n + 1];
-        let cross_l3 = reff[0 * n + 3];
-        assert!(smt < same_l3 && same_l3 < cross_l3, "{} {} {}", smt, same_l3, cross_l3);
-    }
-
-    #[test]
-    fn domains_follow_the_l3_seam() {
-        let t = box_12c();
-        let tree = t.compute_domain_tree();
-        assert_eq!(t.domain_count(), 2);
-        let dom = t.domain_partition(&tree, 2);
-        assert_eq!(dom.len(), 12);
-        for cpu in 0..12 {
-            for other in 0..12 {
-                let same = t.llc_domain[cpu] == t.llc_domain[other];
-                assert_eq!(dom[cpu] == dom[other], same, "cpus {} {}", cpu, other);
-            }
-        }
-        let (_, rank, _) = t.compute_resistance_affinity();
-        // FIVE SAME-DOMAIN PEERS BEFORE THE FIRST CROSS-DOMAIN SLOT.
-        assert_eq!(t.min_in_domain_peers(&rank, &dom), 5);
-        // LEAVES ARE L2 GROUPS: AN SMT PAIR SHARES NO CUT, A SAME-L3 PAIR
-        // CROSSES A TIGHT SEAM (HIGH phi), A CROSS-L3 PAIR A LOOSE ONE (LOW).
-        let phi = t.domain_cross_phi_matrix(&tree);
-        assert_eq!(phi[0 * 12 + 6], u32::MAX);
-        assert_ne!(phi[0 * 12 + 1], u32::MAX);
-        assert_ne!(phi[0 * 12 + 3], u32::MAX);
-        assert!(phi[0 * 12 + 3] < phi[0 * 12 + 1], "{} {}", phi[3], phi[1]);
-        assert_eq!(phi[0 * 12 + 3], phi[3 * 12 + 0]);
-    }
-
-    #[test]
-    fn two_cores_one_l3_price_nothing() {
-        let t = CpuTopology {
-            nr_cpus: 2,
-            l2_domain: vec![0, 1],
-            l2_groups: vec![vec![0], vec![1]],
-            socket_domain: vec![0, 0],
-            llc_domain: vec![0, 0],
-            nr_sockets: 1,
-        };
-        let (reff, rank, spectrum) = t.compute_resistance_affinity();
-        assert!(reff[1] > 0.0);
-        assert_eq!(rank[0], 1);
-        assert_eq!(rank[1], u32::MAX);
-        assert_eq!(rank[2], 0);
-        assert_eq!(t.domain_count(), 1);
-        assert!(spectrum.tau_ns >= TAU_FLOOR_NS && spectrum.tau_ns <= TAU_CEIL_NS);
-    }
 }

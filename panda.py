@@ -565,10 +565,16 @@ def cmd_prism(args: list[str]) -> int:
     if not args:
         log_error("prism needs its arguments, e.g. ./panda.py prism --dev frame --iterations 5")
         return 2
-    field_flags = ("--only", "--schedulers", "--all-scx", "--pandemonium-only")
-    if not any(a in field_flags or a.split("=", 1)[0] in field_flags for a in args):
-        args = [*args, "--only", NAME]
-    return _run_bench([sys.executable, "pandemonium.py", "prism", *args], PANDEMONIUM_DIR)
+    # WHAT FOLLOWS A BARE `--` IS THE BENCH'S OWN; prism's FLAGS END THERE. THE
+    # INSTALLED scx_panda IS THE FIELD UNLESS prism IS TOLD ONE: --arm NAMES
+    # BUILDS BY THEIR BINARIES AND IS A FIELD OF ITS OWN.
+    cut = args.index("--") if "--" in args else len(args)
+    own, child = args[:cut], args[cut:]
+    field_flags = ("--only", "--schedulers", "--all-scx", "--pandemonium-only", "--arm")
+    if not any(a in field_flags or a.split("=", 1)[0] in field_flags for a in own):
+        own = [*own, "--only", NAME]
+    return _run_bench([sys.executable, "pandemonium.py", "prism", *own, *child],
+                      PANDEMONIUM_DIR)
 
 
 def cmd_measure(args: list[str]) -> int:

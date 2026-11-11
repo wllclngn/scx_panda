@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::MapCore;
 
-use crate::bpf_intf::{EWMA_HIST_BUCKETS, MAX_AFFINITY_CANDIDATES, MAX_CPUS};
+use crate::bpf_intf::{EWMA_HIST_BUCKETS, MAX_AFFINITY_CANDIDATES, MAX_CPUS, STEAL_REF_SLOTS};
 use crate::bpf_skel::*;
 use crate::scx_enums as e;
+use crate::topology::AffinityTables;
 
 const SCX_EXIT_NONE: i32 = 0;
 const SCX_ECODE_RST_MASK: u64 = 1 << 16;
@@ -77,14 +78,17 @@ pub struct PandaStats {
     pub nr_steal: u64,
     pub nr_steal_lost: u64,
     pub nr_kick_declined: u64,
+    pub nr_cut_reseat: u64,
+    pub nr_steal_refused: [u64; STEAL_REF_SLOTS],
     pub nr_seat_expect_used: u64,
     pub nr_seat_expect_overrun: u64,
     pub ewma_hist: [u64; EWMA_HIST_BUCKETS],
     pub codel_target_live: u64,
 }
 
-// 20 SCALARS + 6 (nr_cross_domain) + 7 SCALARS + 16 (ewma_hist) + 1 = 50 u64.
-const _: () = assert!(std::mem::size_of::<PandaStats>() == 50 * 8);
+// 20 SCALARS + 6 (nr_cross_domain) + 6 SCALARS + 16 (nr_steal_refused) +
+// 2 SCALARS + 16 (ewma_hist) + 1 = 67 u64.
+const _: () = assert!(std::mem::size_of::<PandaStats>() == 67 * 8);
 const _: () = assert!(MAX_AFFINITY_CANDIDATES == MAX_CPUS >> 3);
 
 pub struct Scheduler<'a> {
@@ -100,6 +104,15 @@ impl<'a> Scheduler<'a> {
         nr_cpus: u32,
         verifier_stats: bool,
     ) -> Result<Self> {
+        // EVERY PER-CPU ARRAY IN THE PROGRAM, AND THE SEATS AND LANES init()
+        // CREATES, STOP AT MAX_CPUS. A WIDER PART WOULD LOAD AND THEN SEAT TASKS
+        // ON QUEUES THAT DO NOT EXIST, SO IT IS REFUSED HERE WITH THE REASON.
+        if nr_cpus > MAX_CPUS {
+            anyhow::bail!(
+                "{} possible CPUs, and scx_panda's per-CPU tables hold {} (MAX_CPUS in src/bpf/intf.h): not loading",
+                nr_cpus, MAX_CPUS
+            );
+        }
         if verifier_stats {
             libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Debug, capture_verifier_print)));
         }
@@ -170,6 +183,16 @@ impl<'a> Scheduler<'a> {
             rodata.__SCX_ENQ_LAST = e::SCX_ENQ_LAST;
             rodata.__SCX_ENQ_CLEAR_OPSS = e::SCX_ENQ_CLEAR_OPSS;
             rodata.__SCX_ENQ_DSQ_PRIQ = e::SCX_ENQ_DSQ_PRIQ;
+        }
+
+        // THE KERNEL'S HOTPLUG SEQUENCE, READ BEFORE THE TOPOLOGY IS. THE KERNEL
+        // COMPARES IT AT ATTACH AND, WHEN A CPU WENT UP OR DOWN IN BETWEEN,
+        // EXITS THE SCHEDULER WITH ITS RESTART CODE: TABLES BUILT AGAINST A SET
+        // OF CPUs THAT HAS SINCE MOVED NEVER RUN, AND main()'s RESTART LOOP
+        // DETECTS AGAIN. AN UNREADABLE SEQUENCE IS LEFT AT ZERO, WHICH THE
+        // KERNEL DOES NOT COMPARE.
+        if let Some(seq) = read_hotplug_seq() {
+            open_skel.struct_ops.panda_ops_mut().hotplug_seq = seq;
         }
 
         // THE DYNAMIC ALLOCATION. THE TABLES ARE DECLARED AT MAX_CPUS AND
@@ -257,6 +280,10 @@ impl<'a> Scheduler<'a> {
             t.nr_steal += s.nr_steal;
             t.nr_steal_lost += s.nr_steal_lost;
             t.nr_kick_declined += s.nr_kick_declined;
+            t.nr_cut_reseat += s.nr_cut_reseat;
+            for i in 0..STEAL_REF_SLOTS {
+                t.nr_steal_refused[i] += s.nr_steal_refused[i];
+            }
             t.nr_seat_expect_used += s.nr_seat_expect_used;
             t.nr_seat_expect_overrun += s.nr_seat_expect_overrun;
             if s.codel_target_live > t.codel_target_live {
@@ -273,39 +300,49 @@ impl<'a> Scheduler<'a> {
         Self::fold_stats(&self.read_stats_percpu())
     }
 
-    fn write_u32(map: &impl MapCore, key: u32, val: u32) -> Result<()> {
-        map.update(&key.to_ne_bytes(), &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)?;
+    // ONE ARRAY MAP, WHOLE, IN ONE CALL: values[k] TO KEY k. ONE ELEMENT A
+    // SYSCALL WAS 512 SYSCALLS A CPU ACROSS THE FOUR TABLES, HALF A MILLION AT
+    // 1,024 CPUs, AND ON HOTPLUG IT LEFT A WALK READING A ROW PART OLD AND PART
+    // NEW FOR AS LONG AS THEY TOOK. THE KERNEL STILL COPIES ELEMENT BY ELEMENT,
+    // SO A WALK CAN CROSS THE COPY; seat_ok() IS WHAT KEEPS A STALE ENTRY FROM
+    // SEATING A TASK ON A CPU THAT WENT DOWN.
+    fn write_table(map: &impl MapCore, values: &[u32]) -> Result<()> {
+        let count = values.len() as u32;
+        if count == 0 {
+            return Ok(());
+        }
+        let keys: Vec<u8> = (0..count).flat_map(|k| k.to_ne_bytes()).collect();
+        let vals: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        map.update_batch(&keys, &vals, count, libbpf_rs::MapFlags::ANY, libbpf_rs::MapFlags::ANY)?;
         Ok(())
     }
 
-    pub fn write_cache_domain(&self, cpu: u32, l2_group: u32) -> Result<()> {
-        Self::write_u32(&self.skel.maps.cache_domain, cpu, l2_group)
+    // cache_domain[cpu] = L2 GROUP.
+    pub fn write_cache_domains(&self, l2_groups: &[u32]) -> Result<()> {
+        Self::write_table(&self.skel.maps.cache_domain, l2_groups)
     }
 
-    pub fn write_cpu_domain(&self, cpu: u32, domain: u32) -> Result<()> {
-        Self::write_u32(&self.skel.maps.cpu_domain, cpu, domain)
+    // cpu_domain[cpu] = EMERGENT DOMAIN.
+    pub fn write_cpu_domains(&self, domains: &[u32]) -> Result<()> {
+        Self::write_table(&self.skel.maps.cpu_domain, domains)
     }
 
-    // THE FOUR TABLES PAIR 1:1 ON cpu * MAX_AFFINITY_CANDIDATES + slot.
-    pub fn write_affinity_rank(&self, cpu: u32, slot: u32, target_cpu: u32) -> Result<()> {
-        Self::write_u32(&self.skel.maps.affinity_rank, cpu * MAX_AFFINITY_CANDIDATES + slot, target_cpu)
+    // THE FOUR TABLES PAIR 1:1 ON cpu * MAX_AFFINITY_CANDIDATES + slot. THE
+    // RANK GOES FIRST: ITS SENTINEL IS WHERE EVERY WALK STOPS.
+    pub fn write_affinity_tables(&self, t: &AffinityTables) -> Result<()> {
+        Self::write_table(&self.skel.maps.affinity_rank, &t.rank)?;
+        Self::write_table(&self.skel.maps.reff_value, &t.value)?;
+        Self::write_table(&self.skel.maps.reff_frac, &t.frac)?;
+        Self::write_table(&self.skel.maps.domain_phi, &t.phi)
     }
 
-    pub fn write_reff_value(&self, cpu: u32, slot: u32, value: u32) -> Result<()> {
-        Self::write_u32(&self.skel.maps.reff_value, cpu * MAX_AFFINITY_CANDIDATES + slot, value)
-    }
-
-    pub fn write_domain_phi(&self, cpu: u32, slot: u32, value: u32) -> Result<()> {
-        Self::write_u32(&self.skel.maps.domain_phi, cpu * MAX_AFFINITY_CANDIDATES + slot, value)
-    }
-
-    pub fn write_reff_frac(&self, cpu: u32, slot: u32, value: u32) -> Result<()> {
-        Self::write_u32(&self.skel.maps.reff_frac, cpu * MAX_AFFINITY_CANDIDATES + slot, value)
-    }
-
-    // THE "GO" SIGNAL. WRITTEN LAST, AFTER EVERY TABLE: THE FIRST TICK THAT
-    // SEES A NON-ZERO tau DERIVES EVERY tau-SCALED STATIC FROM TABLES THAT ARE
-    // ALREADY FILLED.
+    // THE "GO" SIGNAL. WRITTEN LAST, AFTER EVERY TABLE, AND ITS GENERATION
+    // AFTER ITS FIELDS: THE FIRST TICK THAT SEES A NEW GENERATION DERIVES
+    // EVERYTHING topo FEEDS FROM FIELDS AND TABLES THAT ARE ALREADY WRITTEN.
+    // THE MAP IS SHARED MEMORY THE PROGRAM READS WHILE THIS RUNS, SO THE FENCE
+    // KEEPS THE GENERATION'S STORE BEHIND THE FIELDS'. A TOPOLOGY WHOSE tau DID
+    // NOT MOVE STILL CARRIES A NEW GENERATION, AND ITS codel_eq_ns AND PEER
+    // COUNT ARE APPLIED.
     pub fn write_topo(
         &mut self,
         tau_ns: u64,
@@ -318,6 +355,8 @@ impl<'a> Scheduler<'a> {
         data.topo.affinity_domain_peers = affinity_domain_peers;
         data.topo.codel_eq_ns = codel_eq_ns;
         data.topo.tau_ns = tau_ns;
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        data.topo.generation = data.topo.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -348,6 +387,16 @@ impl<'a> Scheduler<'a> {
             .map(|d| d.uei.kind != SCX_EXIT_NONE)
             .unwrap_or(true)
     }
+}
+
+// /sys/kernel/sched_ext/hotplug_seq: A COUNT THE KERNEL ADVANCES ON EVERY CPU
+// ONLINE AND OFFLINE.
+fn read_hotplug_seq() -> Option<u64> {
+    std::fs::read_to_string("/sys/kernel/sched_ext/hotplug_seq")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn cstr<T>(field: &[T]) -> String {
