@@ -59,10 +59,11 @@ const volatile u64 nr_cpu_ids = 1;
 #define WEIGHT_BATCH         128   // 1X
 
 // STARVATION BOUND: THE AGE AT WHICH sweep_bound_preempt FORCES A HEAD OFF ITS
-// CPU. TAU-DERIVED IN apply_tau_scaling() VIA K_LAG_CAP, CLAMPED [8MS, 80MS];
-// 13.3MS AT THE 12C REFERENCE. NOT AN ORDERING BOUND -- task_deadline() RETURNS
-// THE ARRIVAL STAMP AND READS NOTHING ELSE. THE VALUE BELOW IS A FALLBACK HELD
-// ONLY UNTIL THE FIRST CPU-0 TICK DERIVES THE REAL ONE.
+// CPU, AND THE TIME AWAKE PAST WHICH A RESIDENT READS AS ONE THAT DOES NOT
+// SLEEP (seat_spent). TAU-DERIVED IN apply_tau_scaling() VIA K_LAG_CAP, CLAMPED
+// [8MS, 80MS]; 13.3MS AT THE 12C REFERENCE. NOT AN ORDERING BOUND --
+// task_deadline() RETURNS THE ARRIVAL STAMP AND READS NOTHING ELSE. THE VALUE
+// BELOW IS A FALLBACK HELD ONLY UNTIL THE FIRST CPU-0 TICK DERIVES THE REAL ONE.
 static u64 lag_cap_ns = 40000000ULL;
 
 // THE SWEEP'S AND THE TICK SCAN'S WINDOWS. EACH ROTATES ONE SEAT A CLOCK STEP
@@ -269,6 +270,42 @@ static u64 run_start_ns[MAX_CPUS];
 // THE RESIDENT's RUN HABIT, avg_run_ns, STAMPED BESIDE IT. A REMOTE READER
 // PRICES THE SEAT OFF THESE TWO AND NEVER DEREFERENCES THE RESIDENT's task_ctx.
 static u64 run_expect_ns[MAX_CPUS];
+// WHEN THE RESIDENT LAST WOKE, STAMPED BESIDE THEM: A RESIDENT THAT HAS NOT
+// SLEPT FOR THE STARVATION BOUND IS ONE A FAN-OUT WAKE MAY TAKE FROM.
+static u64 run_awake_ns[MAX_CPUS];
+// WHEN A RESIDENT THAT HAD NOT SLEPT FOR THE STARVATION BOUND LAST BEGAN A RUN
+// ON EACH CPU. SUCH A TASK TAKEN FROM WAITS ON ITS LANE AND IS BACK INSIDE A
+// MILLISECOND, SO A STAMP YOUNGER THAN THE BOUND SAYS THE DOMAIN HOLDS ONE
+// WHETHER OR NOT IT IS ON A CPU THIS INSTANT.
+static u64 unslept_ran_ns[MAX_CPUS];
+
+// THE SECOND LOOK. THE STEAL'S AGE BOUND SAYS HOW LONG A HEAD WAITS BEFORE IT
+// MAY MOVE, AND A CPU ABOUT TO IDLE READ IT ONCE, AT THE INSTANT IT FREED: A
+// HEAD A MICROSECOND OLD THERE WAS LEFT, THE CPU SLEPT, AND THE HEAD WAITED
+// FOR ITS RESIDENT OR FOR THE NEXT CPU TO FREE (frame heavy, TRACED: 32 us
+// MORE AT THE MEDIAN, STOLEN ANYWAY SEVEN TIMES IN TEN). A CPU THAT LEAVES A
+// SEAT'S HEAD UNDER ITS AGE BOUND NOW LOOKS AGAIN UNTIL THE HEAD IS OLD ENOUGH
+// TO TAKE OR GONE.
+//   left_at  THE dispatch() WHOSE WALK LEFT SUCH A HEAD, BY ITS CLOCK READING
+//   until    WHEN THE LAST HEAD THE FREEING LOOK LEFT COMES OF AGE
+//   first    THE WALK NOW RUNNING IS THE FREEING LOOK'S
+// ONLY THE LOOK OF A CPU A TASK JUST LEFT OPENS THE WINDOW AND NO LATER LOOK
+// EXTENDS IT, SO A CPU BESIDE A SEAT THAT KEEPS FLOWING YOUNG HEADS SLEEPS WHEN
+// THE WINDOW ENDS. THE WINDOW COUNTS THE PAIR-SPLIT HOLD NO DEARER THAN THE
+// BASE COST: THE HOLD IS 3 TO 6.5 us WHERE SMT SETS THE SEAM, UNDER THE BASE
+// COST, AND THE LOOK WAITS IT OUT (ENDED AT THE BASE COST ALONE THE LOOK GAVE
+// UP A FEW MICROSECONDS SHORT OF MOST HEADS AND BOUGHT NOTHING); ON A PART
+// WITHOUT SMT THE HOLD IS A THIRD OF A TARGET TO A WHOLE ONE, 103 TO 373 us AT
+// 16 CPUs IN TWO L3s, AND NO CPU STAYS AWAKE FOR THAT. ONE CACHE LINE A CPU,
+// WRITTEN BY THAT CPU ALONE. first IS HERE AND NOT IN THE WALK'S STATE:
+// bpf_loop's CALLBACK IS VERIFIED TO CONVERGENCE OVER THAT STATE, AND IT MUST
+// NOT GROW.
+struct steal_look {
+	u64 left_at;
+	u64 until;
+	bool first;
+} __attribute__((aligned(64)));
+static struct steal_look steal_look[MAX_CPUS];
 
 // CODEL STALL DETECTION WITH OSCILLATOR-ADAPTED TARGET
 // BINARY FLOWING/STALLED DECISION (CoDel): IF MIN SOJOURN STAYS ABOVE THE
@@ -501,6 +538,8 @@ struct task_ctx {
 	u32 same_waker_runs; // CONSECUTIVE WAKES FROM last_waker_pid, SATURATING. A
 	                     // LEDGER OF WHAT HAPPENED, NOT A RATE -- THE SAME SHAPE
 	                     // AS standing_runs. RESET BY A WAKE FROM ANOTHER PID.
+	u64 awake_since;     // WHEN THIS TASK LAST WOKE. STAMPED IN runnable(), COPIED TO
+			     // ITS SEAT IN running() FOR seat_spent().
 	u32 wake_waker;      // PID + 1 OF THIS WAKE'S WAKER, 0 = NONE. STAMPED IN
 	                     // select_cpu, WHERE THE WAKER IS current, FOR enqueue,
 	                     // WHICH A QUEUED WAKEUP RUNS ON THE WAKEE'S CPU; CLEARED
@@ -1287,6 +1326,94 @@ static __always_inline s32 find_spill_seat(s32 src_cpu,
 	return best_cpu;
 }
 
+// A SEAT A FAN-OUT WAKE MAY TAKE: ITS RESIDENT HAS HAD ITS FIRST TARGET, WHICH
+// THE CLOCK PROMISES ANY TASK BEFORE IT IS JUDGED (resident_owed), AND NOTHING
+// WAITS ON ITS PER-CPU DSQ OR ITS LOCAL DSQ. THE RESIDENT IS A sched_ext TASK
+// THAT IS NEITHER THE TASK BEING SEATED NOR ITS WAKER.
+// TWO KINDS, BY THE RESIDENT'S OWN HISTORY AND NOT A CLASS. ONE THAT HAS NOT
+// SLEPT FOR THE STARVATION BOUND, lag_cap_ns, STAYS RUNNABLE WHATEVER IS
+// TAKEN FROM IT: SEAT_UNSLEPT. ONE THAT BLOCKS OF ITS OWN ACCORD, A FRAME'S
+// RENDER STAGE 1.8 ms LONG, IS SEAT_SPENT, AND THE WALK TAKES FROM IT ONLY
+// WHERE NO RESIDENT OF THE DOMAIN IS UNSLEPT: BESIDE RESIDENTS THAT NEVER
+// YIELD, A TASK CUT MID-STAGE WAITS ON ITS LANE FOR A CPU THAT DOES NOT COME
+// FREE. *unslept IS SET FOR SUCH A RESIDENT WHETHER OR NOT ITS SEAT MAY BE
+// TAKEN NOW, AND FOR A SEAT ONE RAN ON INSIDE THE LAST BOUND: TAKEN FROM, IT
+// IS ON A LANE AND NOT ON ANY CPU.
+// MEASURED ON FRAME AT EIGHT ROUNDS. TAKING FROM ANY SPENT RESIDENT, CONTENDED'S
+// 1% LOW READ 315 WHERE THIS READS 336, RENDER SENT TO ITS LANE THREE TIMES AS
+// OFTEN. TAKING FROM THE UNSLEPT ALONE, HEAVY READ 420 FPS WHERE THIS READS 424.
+// ASKING ONLY WHO IS ON A CPU THIS INSTANT LOSES THE UNSLEPT MID-BURST, EACH
+// JUST TAKEN FROM, AND CONTENDED'S 1% LOW READ 319.
+enum seat_take { SEAT_KEPT = 0, SEAT_SPENT = 1, SEAT_UNSLEPT = 2 };
+
+static __always_inline enum seat_take seat_spent(s32 cpu,
+						 const struct task_struct *p,
+						 u32 waker_pid, u64 now,
+						 bool *unslept)
+{
+	if (!seat_ok(cpu) || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+		return SEAT_KEPT;
+	u32 slot = cpu_slot((u32)cpu);
+	u64 ran = unslept_ran_ns[slot];
+	if (ran && ran <= now && now - ran < lag_cap_ns)
+		*unslept = true;
+	struct task_struct *curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+	if (!curr || curr == p || (curr->flags & PF_IDLE) ||
+	    !(curr->scx.flags & SCX_TASK_QUEUED))
+		return SEAT_KEPT;
+	u64 awake = run_awake_ns[slot];
+	bool never = awake && awake <= now && now - awake >= lag_cap_ns;
+	if (never)
+		*unslept = true;
+	if ((u32)curr->pid == waker_pid)
+		return SEAT_KEPT;
+	u64 start = run_start_ns[slot];
+	if (start > now || now - start < codel_target_ns)
+		return SEAT_KEPT;
+	if (scx_bpf_dsq_nr_queued((u64)cpu) ||
+	    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | (u64)cpu))
+		return SEAT_KEPT;
+	return never ? SEAT_UNSLEPT : SEAT_SPENT;
+}
+
+// THE SEAT TO TAKE IN near'S CACHE DOMAIN: near ITSELF, THEN ITS PEERS IN
+// R_eff ORDER UNDER THE SPILL'S BUDGET. THE NEAREST UNSLEPT RESIDENT'S; WHERE
+// THE DOMAIN HOLDS NONE AT ALL, THE NEAREST SPENT ONE'S; ELSE -1.
+static __always_inline s32 spent_seat(const struct task_struct *p, s32 near,
+				      u32 waker_pid, u64 now)
+{
+	if (near < 0 || (u32)near >= nr_cpu_ids)
+		return -1;
+	bool unslept = false;
+	s32 sleeper = -1;
+	enum seat_take k = seat_spent(near, p, waker_pid, now, &unslept);
+	if (k == SEAT_UNSLEPT)
+		return near;
+	if (k == SEAT_SPENT)
+		sleeper = near;
+	u32 base = (u32)near * MAX_AFFINITY_CANDIDATES;
+	u32 dom = cpu_domain_of(near);
+	u32 checked = 0;
+	int i;
+	bpf_for(i, 0, PCPU_SPILL_SCAN_MAX) {
+		u32 key = base + (u32)i;
+		u32 *val = bpf_map_lookup_elem(&affinity_rank, &key);
+		if (!val || *val == (u32)-1)
+			break;
+		s32 peer = (s32)*val;
+		if (cpu_domain_of(peer) != dom)
+			continue;
+		k = seat_spent(peer, p, waker_pid, now, &unslept);
+		if (k == SEAT_UNSLEPT)
+			return peer;
+		if (k == SEAT_SPENT && sleeper < 0)
+			sleeper = peer;
+		if (++checked >= pcpu_spill_search_budget)
+			break;
+	}
+	return unslept ? -1 : sleeper;
+}
+
 // A CPU THE TASK MAY RUN ON: near WHEN IT IS ONLINE AND THE TASK'S MASK ALLOWS
 // IT, ELSE ONE PICKED FROM THE MASK ON near's NODE, AN IDLE ONE FIRST. A USER
 // DSQ ADMITS ANY TASK, BUT ONLY A CPU THE TASK MAY RUN ON CAN MOVE IT TO LOCAL,
@@ -1547,7 +1674,8 @@ static __always_inline void apply_tau_scaling(void)
 		affinity_search_online = b;
 	}
 
-	// STARVATION BOUND, THE ONLY JOB IT HAS: lag_cap_ns = K_LAG_CAP * tau
+	// STARVATION BOUND, AND seat_spent's TEST OF A RESIDENT THAT DOES NOT SLEEP:
+	// lag_cap_ns = K_LAG_CAP * tau
 	// (1.0 * tau, 13.3MS AT THE 12C REFERENCE), CLAMPED [8MS, 80MS].
 	v = scale_tau(tau_ns, K_LAG_CAP);
 	if (v < 8000000ULL)  v = 8000000ULL;
@@ -2292,6 +2420,37 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 		    ? tctx->last_cpu
 		    : __COMPAT_scx_bpf_pick_any_cpu_node(p->cpus_ptr, node, 0);
 		if (seat_ok(cpu)) {
+			// A FAN-OUT WAKE THAT REACHES THIS TIER FOUND NO CPU IDLE ON THE
+			// NODE. QUEUED ON ITS WARM SEAT IT WAITS OUT A WORKER'S STINT OR
+			// THE BAND WHILE A SEAT BESIDE IT HOLDS A RESIDENT THAT HAS HAD
+			// ITS FIRST TARGET AND NO HEAD. IT TAKES THAT SEAT'S QUEUE AND
+			// PREEMPTS (spent_seat); WITH NONE IT IS SEATED AS BEFORE.
+			if (is_wakeup && tctx->fanout_wake && !is_migration_disabled(p)) {
+				u64 fnow = bpf_ktime_get_ns();
+				s32 spent = spent_seat(p, cpu,
+						       tctx->wake_waker ? tctx->wake_waker - 1 : 0,
+						       fnow);
+				if (spent >= 0) {
+					dl = task_deadline(tctx, fnow);
+					// IT TAKES THE SEAT'S QUEUE, WHICH seat_spent FOUND EMPTY,
+					// AND THE KICK SENDS THE RESIDENT OFF: NOT THE LOCAL DSQ,
+					// WHERE A CUT ARRIVING NEXT QUEUES BEHIND IT AND NO THIEF
+					// OR CLOCK REACHES IT. MEASURED: ON THE LOCAL DSQ
+					// CONTENDED READ 422 FPS AND ITS 0.1% LOW 222, ON THE
+					// SEAT'S QUEUE 425 AND 260.
+					seat_task(p, tctx, spent, -1, (u64)spent, sl, dl,
+						  false, SCX_KICK_PREEMPT, enq_flags, fnow);
+					tctx->dispatch_path = 1;
+					struct panda_stats *fs = get_stats();
+					if (fs) {
+						fs->nr_shared += 1;
+						fs->nr_dispatches += 1;
+						fs->nr_hard_kicks += 1;
+						fs->nr_enq_wakeup += 1;
+					}
+					return;
+				}
+			}
 			s32 t2_cpu;
 			u64 tier2_dsq = pick_pcpu_dsq_with_spill(p, cpu, p->cpus_ptr, is_handoff_partner(tctx), false, bpf_ktime_get_ns(), &t2_cpu);
 
@@ -2599,6 +2758,26 @@ static int steal_scan_step(u32 i, void *ctx_)
 						   : STEAL_REF_PAIR);
 					rs->nr_steal_refused[idx & (STEAL_REF_SLOTS - 1)] += 1;
 				}
+				// THE SECOND LOOK'S MARK: A SEAT'S HEAD A CPU ABOUT TO IDLE
+				// LEAVES. THE LOOK'S OWN BOUND IS THE BASE COST AND THE HOLD,
+				// THE HOLD COUNTED NO DEARER THAN THE BASE COST; THE FREEING
+				// LOOK SETS THE WINDOW'S END, THE LATEST OF THE HEADS IT
+				// LEAVES TO REACH IT. A HEAD HELD PAST THAT IS LEFT AS IT WAS.
+				if (c->would_idle && !c->lanes) {
+					u64 look_bound = phi_base_cost_ns +
+						(pair_hold < phi_base_cost_ns ? pair_hold
+									     : phi_base_cost_ns);
+					if (peer_wait < look_bound) {
+						struct steal_look *lk =
+							&steal_look[cpu_slot(c->my_cpu)];
+						if (lk->first) {
+							u64 due = c->now + (look_bound - peer_wait);
+							if (lk->left_at != c->now || due > lk->until)
+								lk->until = due;
+						}
+						lk->left_at = c->now;
+					}
+				}
 			}
 		}
 		if (++c->checked >= c->budget)
@@ -2728,6 +2907,11 @@ void BPF_STRUCT_OPS(panda_dispatch, s32 cpu, struct task_struct *prev)
 	// ABOUT TO IDLE.
 	bool would_idle = !(prev && !(prev->flags & PF_EXITING) &&
 				(prev->scx.flags & SCX_TASK_QUEUED));
+	// THE FREEING LOOK: A TASK JUST LEFT THIS CPU. THE WALK READS WHETHER IT
+	// IS ONE FROM THIS CPU'S LINE, AND ONLY A CPU ABOUT TO IDLE WRITES IT.
+	struct steal_look *lk = &steal_look[slot];
+	if (would_idle)
+		lk->first = prev != NULL;
 
 	// SCAN RATE-LIMIT, ONE WINDOW FOR BOTH WALKS. A CPU ABOUT TO IDLE SCANS
 	// EVERY TIME: IT IS ON NO WAKE PATH, AND WHAT IT LEAVES WAITS WHILE IT
@@ -2759,6 +2943,16 @@ void BPF_STRUCT_OPS(panda_dispatch, s32 cpu, struct task_struct *prev)
 	// STEP 3: A PEER'S LANE, AT THE SAME PRICES.
 	if (scan && steal_from(cpu, now, would_idle, true))
 		return;
+
+	// THE SECOND LOOK: THIS CPU IS ABOUT TO IDLE AND ITS WALK LEFT A SEAT'S
+	// HEAD UNDER THE LOOK'S BOUND, INSIDE THE WINDOW ITS FREEING LOOK OPENED.
+	// SCX_KICK_IDLE ON ITSELF: THE KERNEL FINISHES THIS CYCLE, PICKS THE IDLE
+	// TASK AND RESCHEDULES IT, AND dispatch() RUNS AGAIN A MICROSECOND OR TWO
+	// LATER. A CPU GIVEN WORK IN BETWEEN IS NOT IDLE AND IS NOT KICKED.
+	if (would_idle && lk->left_at == now && now < lk->until) {
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		return;
+	}
 
 	// NOTHING QUEUED OR STEALABLE -- KEEP PREV RUNNING IF POSSIBLE
 	if (prev && !(prev->flags & PF_EXITING) &&
@@ -2796,6 +2990,7 @@ void BPF_STRUCT_OPS(panda_runnable, struct task_struct *p,
 	// last_woke_at HAS ONE JOB: WAKE LATENCY. STAMPED HERE, READ AND CLEARED IN
 	// running(). NOTHING ELSE READS IT.
 	tctx->last_woke_at = now;
+	tctx->awake_since = now;
 
 	// TIER IS TWO DECLARATIONS, STATED DIRECTLY RATHER THAN SCORED:
 	//   PF_WQ_WORKER     -> INTERACTIVE    (USERSPACE BLOCKS ON THESE)
@@ -2828,6 +3023,10 @@ void BPF_STRUCT_OPS(panda_running, struct task_struct *p)
 		u32 slot = cpu_slot(bpf_get_smp_processor_id());
 		run_start_ns[slot] = now;
 		run_expect_ns[slot] = tctx->avg_run_ns;
+		run_awake_ns[slot] = tctx->awake_since;
+		if (tctx->awake_since && now > tctx->awake_since &&
+		    now - tctx->awake_since >= lag_cap_ns)
+			unslept_ran_ns[slot] = now;
 	}
 	tctx->run_exec_at = p->se.sum_exec_runtime;   // service base, see stopping()
 	tctx->ran_since_wake = true;   // is_wakeup = !ran_since_wake
