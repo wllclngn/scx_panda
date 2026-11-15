@@ -6,7 +6,10 @@
 // A RUST CONSTANTS FILE, SO THE LOADER WRITES THE RODATA SHIMS FROM THE KERNEL
 // THE PROGRAM WAS BUILT AGAINST AND NEVER FROM A HAND LIST.
 // vmlinux.h IS CACHED AT $HOME/.cache/panda/vmlinux-<release>.h, KEYED ON THE
-// RUNNING KERNEL'S RELEASE, AND GENERATED FROM ITS BTF VIA bpftool ON A MISS.
+// KERNEL'S RELEASE, AND GENERATED FROM ITS BTF VIA bpftool ON A MISS. THE KERNEL
+// IS THE RUNNING ONE UNLESS PANDA_BTF NAMES ANOTHER'S BTF, A vmlinux OR A RAW
+// BLOB, AND PANDA_BTF_RELEASE ITS RELEASE: THE TREE THEN BUILDS HERE AGAINST A
+// KERNEL THAT IS NOT RUNNING.
 
 use std::env;
 use std::path::PathBuf;
@@ -23,9 +26,19 @@ fn main() {
     std::fs::create_dir_all(&vmlinux_dir).expect("failed to create vmlinux dir");
     let vmlinux_h = vmlinux_dir.join("vmlinux.h");
 
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rerun-if-env-changed=PANDA_BTF");
+    println!("cargo:rerun-if-env-changed=PANDA_BTF_RELEASE");
+    let other_btf = env::var("PANDA_BTF").ok();
+    let release = match (&other_btf, env::var("PANDA_BTF_RELEASE").ok()) {
+        (Some(_), Some(r)) => r,
+        (Some(_), None) => {
+            panic!("PANDA_BTF is set: name its kernel's release in PANDA_BTF_RELEASE")
+        }
+        (None, _) => std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".into()),
+    };
+    let btf_path = other_btf.unwrap_or_else(|| "/sys/kernel/btf/vmlinux".into());
     let cache_dir = PathBuf::from(env::var("HOME").expect("HOME not set"))
         .join(".cache")
         .join("panda");
@@ -38,7 +51,7 @@ fn main() {
         std::fs::read_to_string(&cache_path).expect("cached vmlinux.h is not utf-8")
     } else {
         let output = Command::new("bpftool")
-            .args(["btf", "dump", "file", "/sys/kernel/btf/vmlinux", "format", "c"])
+            .args(["btf", "dump", "file", btf_path.as_str(), "format", "c"])
             .output()
             .expect("bpftool not found: install it once for the first build on this kernel");
         if !output.status.success() {

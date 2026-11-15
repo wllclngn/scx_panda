@@ -179,6 +179,13 @@ struct tuning_knobs knobs_g = {
 //   last_sojourn_ns       THE WAIT OF THE LATEST TASK TO LEAVE TO RUN
 //   next_act              THE EARLIEST THE JUDGE MAY ACT ON THIS QUEUE AGAIN
 //   acts                  ACTS SINCE THE WAIT ROSE PAST ITS BOUND (CoDel's count)
+//   resumed_n, resumed_since  A LANE'S ONLY: THE TASKS RESUMED AT ITS HEAD
+//                         (enqueue's LAST TIER) AND WHEN THE OLDEST OF THEM
+//                         BEGAN TO WAIT. THEY STAND AHEAD OF THE QUEUE AND ARE
+//                         IN NONE OF THE COUNTS ABOVE: THE CLOCK KEEPS READING
+//                         THE LANE'S OWN WORK
+//   cut_ns                A SEAT'S ONLY: WHEN THE LATEST CUT ONTO IT WAS MADE,
+//                         WRITTEN BESIDE cut_pid. enqueue's LAST TIER READS IT
 //   cut_pid               A SEAT'S ONLY: THE PID THE LATEST CUT ONTO IT WAS FOR.
 //                         WRITTEN BY THE CUT BESIDE ITS ARRIVAL, ON THE LINE THE
 //                         ARRIVAL ALREADY DIRTIES. SEE CUT_SELF_KICK_NS
@@ -190,6 +197,11 @@ struct queue_clock {
 	u64 next_act;
 	u64 acts;
 	s32 cut_pid;
+	u32 resumed_n;
+	union {
+		u64 resumed_since;
+		u64 cut_ns;
+	};
 } __attribute__((aligned(64)));
 
 // floor(sqrt(n)) FOR n IN [0, QCLOCK_ACTS_CAP]. THE CONTROL LAW'S DIVISOR, AS A
@@ -522,6 +534,9 @@ struct task_ctx {
 	                     // CLEARED IN running() AND quiescent(). THE SOJOURN BASE.
 	u64 queued_on;       // DSQ ID + 1 OF THE QUEUE THIS TASK SITS ON, 0 = NONE.
 	                     // SET ON INSERT, CLEARED BY ITS DEPARTURE.
+	u64 wake_svc_ns;     // SERVICE SINCE THIS TASK LAST WOKE: ZEROED IN runnable(),
+	                     // ADVANCED IN stopping(). enqueue's RESUME READS IT
+	                     // AGAINST ONE LIVE TARGET.
 	u64 run_exec_at;     // p->se.sum_exec_runtime AT running(). THE SERVICE LEDGER'S
 	                     // BASE: stopping() DIFFS IT FOR TIME THE TASK ACTUALLY RAN,
 	                     // WHICH IS ELAPSED MINUS THE IRQ TIME INSIDE THE WINDOW.
@@ -557,6 +572,9 @@ struct task_ctx {
 	                     // SO THE TASK RETURNS HOME INSTEAD OF DRIFTING. THE
 	                     // RESTORING FORCE -- SEE THE ANCHOR IN warm_seat_pick.
 	u8  dispatch_path;   // 0=IDLE, 1=HARD_KICK, 2=SOFT_KICK
+	u16 resumed;         // SLOT + 1 OF THE LANE THIS TASK WAS RESUMED AT THE HEAD OF
+	                     // (enqueue's LAST TIER), 0 = NONE. CLEARED IN
+	                     // qclock_depart, WHICH TAKES IT OFF THAT LANE'S RECORD.
 	u8  ran_since_wake;  // is_wakeup = !ran_since_wake; SET 1 IN running(), 0 ON WAKE
 	u8  sync_wake;       // THIS WAKE CARRIED SCX_WAKE_SYNC. SET IN select_cpu, WHICH
 	                     // RUNS BEFORE enqueue ON THE SAME WAKE; CLEARED IN running().
@@ -606,7 +624,19 @@ static __always_inline struct queue_clock *qclock_of(u64 dsq)
 // SOJOURN. A TASK REMOVED UNRUN (SLEEP, EXIT, SETAFFINITY) IS PROGRESS ONLY.
 static __always_inline void qclock_depart(struct task_ctx *tctx, u64 now, bool ran)
 {
-	if (!tctx || !tctx->queued_on)
+	if (!tctx)
+		return;
+	// A RESUMED TASK LEAVES ITS LANE'S HEAD. THE NEXT OF THEM, IF ANY, IS READ
+	// AS WAITING FROM NOW: ITS OWN ARRIVAL IS NOT KEPT, AND THE ERROR RUNS
+	// TOWARD LEAVING IT FOR ITS OWN CPU, NEVER TOWARD A WAIT THAT GROWS.
+	if (tctx->resumed) {
+		struct queue_clock *rq =
+			&lane_qclock[(u32)(tctx->resumed - 1) & (MAX_CPUS - 1)];
+		tctx->resumed = 0;
+		if (__sync_sub_and_fetch(&rq->resumed_n, 1) != 0)
+			rq->resumed_since = now;
+	}
+	if (!tctx->queued_on)
 		return;
 	struct queue_clock *q = qclock_of(tctx->queued_on - 1);
 	tctx->queued_on = 0;
@@ -651,6 +681,15 @@ static __always_inline u64 queue_wait(const struct queue_clock *q, u64 now)
 	u64 p = q->progress_ns;
 	u64 stall = now > p ? now - p : 0;
 	return q->last_sojourn_ns + stall;
+}
+
+// HOW LONG THE TASK RESUMED AT A LANE'S HEAD HAS WAITED THERE, 0 WITH NONE.
+// IT IS THE LANE'S HEAD, SO IT IS THE TASK A STEAL WOULD TAKE AND THE ONE THE
+// LANE'S NEXT SERVE RUNS, AND ITS OWN AGE IS WHAT THOSE ARE PRICED ON.
+static __always_inline u64 lane_resumed_wait(const struct queue_clock *lq, u64 now)
+{
+	u64 since = lq->resumed_since;
+	return (lq->resumed_n && now > since) ? now - since : 0;
 }
 
 static __always_inline struct panda_stats *get_stats(void);
@@ -1113,6 +1152,7 @@ static __always_inline enum seat_how seat_task(struct task_struct *p,
 		 seat_cut(p, seat, sl, enq_flags)) {
 		how = SEAT_CUT;
 		pcpu_qclock[cpu_slot((u32)seat)].cut_pid = p->pid;
+		pcpu_qclock[cpu_slot((u32)seat)].cut_ns = now;
 		if (tctx)
 			tctx->cut_at = now;
 	} else
@@ -2505,6 +2545,47 @@ void BPF_STRUCT_OPS(panda_enqueue, struct task_struct *p,
 	u64 t3_dsq = is_wakeup ? (u64)t3_cpu : lane_dsq((u32)t3_cpu);
 	u64 now = bpf_ktime_get_ns();
 	dl = tctx ? task_deadline(tctx, now) : now;
+	// A RESIDENT DISPLACED BY A CUT RESUMES FROM THE HEAD OF ITS LANE. A CUT PUTS
+	// ITS WAKE ON THE SEAT'S LOCAL DSQ AND KICKS, AND THE RESIDENT, TAKEN OFF
+	// WITH ITS WORK LEFT, WENT TO THE BACK OF ITS LANE BEHIND EVERY REQUEUE THAT
+	// HAS HAD ITS RUN: PipeWire's DATA LOOP, CUT A THOUSAND TIMES A PASS UNDER A
+	// FORK STORM, WAITED 11 ms EACH TIME AND MISSED A FIFTH OF ITS PERIODS AT 2
+	// CPUs WHERE EEVDF MISSED NONE. A REQUEUE WITHIN ONE LIVE TARGET OF A CUT
+	// ONTO ITS SEAT (cut_ns, THE STAMP THE CUT WRITES) IS THAT RESIDENT, AND IT
+	// TAKES THE LANE'S HEAD: EVERY CUT STILL RUNS AHEAD OF IT, THE SEAT IS JUDGED
+	// AGAINST THE LANE AS BEFORE, AND WHEN THE LANE IS NEXT SERVED IT IS THE
+	// TASK THAT WAS INTERRUPTED THAT RUNS ON, NOT ONE THAT HAS HAD ITS RUN.
+	// BOUNDED BY ONE LIVE TARGET OF SERVICE SINCE THE WAKE.
+	// THE CUT IS READ FROM ITS STAMP AND NOT FROM THE LOCAL DSQ: dispatch RUNS
+	// BEFORE THE RESIDENT IS REQUEUED, SO THE LOCAL DSQ HOLDS A SUCCESSOR AT
+	// NEARLY EVERY REQUEUE, AND RESUMING ON THAT RESUMED EVERY TASK THE TICK OR
+	// THE SWEEP TOOK OFF FOR A WAITER, AHEAD OF THE WAITER: fork-thread READ
+	// 9.4M RESUMES AND A WALL 5 PERCENT LONGER. IT STANDS AT THE LAST TIER
+	// BECAUSE AN IDLE CPU COMES FIRST, AND ON THE LANE BECAUSE ON THE LOCAL DSQ
+	// IT STOOD AHEAD OF LATER CUTS AND TOOK A THIRD OF frame's CONTENDED 1% LOW.
+	// IT IS KEPT OUT OF THE LANE'S CLOCK AND ON THE LANE'S OWN RECORD OF ITS
+	// HEAD (resumed_n, resumed_since).
+	if (tctx && !is_wakeup && t3_cpu == tcpu &&
+	    tcpu == (s32)bpf_get_smp_processor_id() &&
+	    tctx->wake_svc_ns < codel_target_ns && (u64)tcpu < nr_cpu_ids &&
+	    now >= pcpu_qclock[cpu_slot((u32)tcpu)].cut_ns &&
+	    now - pcpu_qclock[cpu_slot((u32)tcpu)].cut_ns < codel_target_ns) {
+		u32 rslot = cpu_slot((u32)tcpu);
+		struct queue_clock *rq = &lane_qclock[rslot];
+		qclock_depart(tctx, now, false);
+		scx_bpf_dsq_insert_vtime(p, t3_dsq, sl, 1, enq_flags);
+		if (__sync_fetch_and_add(&rq->resumed_n, 1) == 0)
+			rq->resumed_since = now;
+		tctx->resumed = (u16)(rslot + 1);
+		tctx->dispatch_path = 2;
+		struct panda_stats *rs = get_stats();
+		if (rs) {
+			rs->nr_shared += 1;
+			rs->nr_kick_declined += 1;
+			rs->nr_enq_requeue += 1;
+		}
+		return;
+	}
 	u64 kick_flag = requeue_kick_flag(tctx, t3_cpu, is_wakeup, !is_wakeup);
 	if (seat_task(p, tctx, t3_cpu, -1, t3_dsq, sl, dl,
 			  is_wakeup && wake_cuts(tctx), kick_flag,
@@ -2681,6 +2762,13 @@ static int steal_scan_step(u32 i, void *ctx_)
 		struct queue_clock *pq = c->lanes ? &lane_qclock[cpu_slot(peer)]
 						  : &pcpu_qclock[cpu_slot(peer)];
 		u64 peer_wait = queue_wait(pq, c->now);
+		// A LANE WITH A RESUMED TASK AT ITS HEAD IS PRICED ON THAT TASK'S OWN
+		// WAIT, SINCE IT IS THE ONE THE MOVE WOULD TAKE. PRICED ON THE LANE'S
+		// CLOCK, WHICH READS THE OLDER WORK BEHIND IT, A TASK CUT MICROSECONDS
+		// AGO WAS TAKEN OFF ITS CPU AT ONCE: fork-thread READ 3.1M STEALS
+		// AGAINST 0.6M AND A WALL 8 PERCENT LONGER.
+		if (c->lanes && pq->resumed_n)
+			peer_wait = lane_resumed_wait(pq, c->now);
 		if (peer_wait == 0) {
 			if (++c->checked >= c->budget)
 				return 1;
@@ -2882,6 +2970,11 @@ void BPF_STRUCT_OPS(panda_dispatch, s32 cpu, struct task_struct *prev)
 	// 551 us AGAINST 15. PAST lag_cap_ns THE LANE IS SERVED ANYWAY, SO THE
 	// STARVATION BOUND STANDS.
 	u64 lane_wait = queue_wait(&lane_qclock[slot], now);
+	{
+		u64 rw = lane_resumed_wait(&lane_qclock[slot], now);
+		if (rw > lane_wait)
+			lane_wait = rw;
+	}
 	u64 pw = pair_warm_ns[slot];
 	bool pair_live = pw && now >= pw && now - pw < codel_target_ns &&
 			 lane_wait < lag_cap_ns;
@@ -2986,6 +3079,7 @@ void BPF_STRUCT_OPS(panda_runnable, struct task_struct *p,
 
 	u64 now = bpf_ktime_get_ns();
 	tctx->ran_since_wake = false;
+	tctx->wake_svc_ns = 0;
 
 	// last_woke_at HAS ONE JOB: WAKE LATENCY. STAMPED HERE, READ AND CLEARED IN
 	// running(). NOTHING ELSE READS IT.
@@ -3101,6 +3195,7 @@ void BPF_STRUCT_OPS(panda_stopping, struct task_struct *p,
 	// KERNEL'S OWN EXECUTION ACCOUNTING AND EXCLUDES EXACTLY THAT TIME.
 	u64 svc = p->se.sum_exec_runtime > tctx->run_exec_at
 		? p->se.sum_exec_runtime - tctx->run_exec_at : 0;
+	tctx->wake_svc_ns += svc;
 
 	// SERVICE LEDGER: A RUN THAT CONSUMED A FULL TARGET ADVANCES THE COUNT, ANY
 	// SHORTER RUN CLEARS IT. SATURATES SO A LONG HOG CANNOT BANK UNBOUNDED CREDIT.
@@ -3331,6 +3426,9 @@ void BPF_STRUCT_OPS(panda_tick, struct task_struct *p)
 		struct queue_clock *lq = &lane_qclock[lslot];
 		u64 lnow = bpf_ktime_get_ns();
 		u64 lw = queue_wait(lq, lnow);
+		u64 lrw = lane_resumed_wait(lq, lnow);
+		if (lrw > lw)
+			lw = lrw;
 		u64 lpw = pair_warm_ns[lslot];
 		bool lpair = lpw && lnow >= lpw && lnow - lpw < codel_target_ns;
 		u64 net_bound = (lpair || p->policy == SCHED_FIFO ||

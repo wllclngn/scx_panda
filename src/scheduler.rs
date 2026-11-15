@@ -195,6 +195,21 @@ impl<'a> Scheduler<'a> {
             open_skel.struct_ops.panda_ops_mut().hotplug_seq = seq;
         }
 
+        // THE OBJECT CARRIES THE OPS FLAGS OF THE KERNEL IT WAS BUILT ON, AND A
+        // KERNEL REFUSES A REGISTRATION THAT HOLDS A FLAG IT HAS NO BIT FOR:
+        // 6.13 KNOWS NEITHER SCX_OPS_BUILTIN_IDLE_PER_NODE NOR
+        // SCX_OPS_ALLOW_QUEUED_WAKEUP, AND THE ATTACH ENDED IN EINVAL. A KERNEL
+        // WITHOUT THE PER-NODE FLAG HAS NO PER-NODE KFUNCS EITHER, AND THE
+        // PROGRAM'S __COMPAT CALLS FALL BACK WITH IT.
+        if let Some(known) = kernel_ops_flags() {
+            let ops = open_skel.struct_ops.panda_ops_mut();
+            let dropped = ops.flags & !known;
+            if dropped != 0 {
+                log_info!("this kernel has no ops flags {:#x}: registering without them", dropped);
+                ops.flags &= known;
+            }
+        }
+
         // THE DYNAMIC ALLOCATION. THE TABLES ARE DECLARED AT MAX_CPUS AND
         // SIZED HERE TO THE CPUs THIS BOX HAS; THE BPF TREATS A LOOKUP PAST THE
         // END AS THE SENTINEL.
@@ -397,6 +412,20 @@ fn read_hotplug_seq() -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+// THE OPS FLAGS THE RUNNING KERNEL TAKES, FROM ITS OWN BTF: SCX_OPS_ALL_FLAGS OF
+// enum scx_ops_flags, THE MASK ITS REGISTRATION CHECKS AGAINST. None WHEN THE
+// BTF OR THE ENUMERATOR CANNOT BE READ, AND THE FLAGS THEN STAND AS BUILT.
+fn kernel_ops_flags() -> Option<u64> {
+    use libbpf_rs::btf::types::{Enum, Enum64};
+    let btf = libbpf_rs::btf::Btf::from_vmlinux().ok()?;
+    let all = std::ffi::OsStr::new("SCX_OPS_ALL_FLAGS");
+    if let Some(en) = btf.type_by_name::<Enum64>("scx_ops_flags") {
+        return en.iter().find(|m| m.name == Some(all)).map(|m| m.value as u64);
+    }
+    let en = btf.type_by_name::<Enum>("scx_ops_flags")?;
+    en.iter().find(|m| m.name == Some(all)).map(|m| m.value as u64)
 }
 
 fn cstr<T>(field: &[T]) -> String {

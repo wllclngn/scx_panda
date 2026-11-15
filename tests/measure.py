@@ -17,7 +17,8 @@ Usage:
 
 --cores applies to scale; frame runs at native width. --child-args reaches
 the bench itself, so one cell runs alone: --child-args="--scenarios contended"
-for frame, --child-args="--ipc" (or --burst, --deadline) for scale.
+for frame, --child-args="--cells ipc" for scale (any of latency, compile,
+burst, longrun, mixed, deadline, ipc and launch, comma-separated).
 --prism-args reaches prism: --prism-args="--trace" records montauk captures.
 Both take their value after an = sign, since the value starts with a dash.
 Runs as the user. panda.py and prism ask for sudo where a step needs it.
@@ -265,8 +266,8 @@ def newest_report(bench_name: str, since: float) -> Path | None:
     cands = [p for p in REPORT_DIR.glob(f"prism-{bench_name}-*.log")
              if p.stat().st_mtime >= since]
     if not cands:
-        # A SCALE CHILD RUN IN ONE MODE NAMES ITS REPORT FOR THE MODE
-        # (prism-ipc, prism-burst, ...), NOT FOR scale.
+        # A SCALE CHILD RUN ON ONE CELL NAMES ITS REPORT FOR THE CELL
+        # (prism-ipc, prism-burst, ...) AND ON SEVERAL prism-cells, NOT FOR scale.
         cands = [p for p in REPORT_DIR.glob("prism-*.log") if p.stat().st_mtime >= since]
     return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
 
@@ -319,7 +320,7 @@ def main() -> int:
     ap.add_argument("--child-args", default="", metavar="FLAGS",
                     help="flags for the bench child itself, written with =, e.g. "
                          "--child-args=\"--scenarios contended\" for frame or "
-                         "--child-args=\"--ipc\" for scale")
+                         "--child-args=\"--cells ipc\" for scale")
     ap.add_argument("--control", action="store_true",
                     help="also run PANDEMONIUM's two arms (prism --pandemonium-only)")
     ap.add_argument("--dry-run", action="store_true", help="print the commands only")

@@ -30,7 +30,7 @@
 #   6. REPLACES THE BUILD-TIME ENUM SHIMS WITH scx_utils::import_enums!, WHICH
 #      READS THE RUNNING KERNEL'S BTF AT LOAD; src/scx_enums.rs IS NOT EXPORTED
 #   7. PATCHES bpf_skel.rs INCLUDE PATH FOR BpfBuilder OUTPUT
-#   8. INJECTS THE VERSION SUFFIX INTO THE OPS NAME FOR scx_loader's DISPLAY
+#   8. INJECTS THE VERSION SUFFIX INTO THE OPS NAME
 #   9. ADDS THE WORKSPACE MEMBER TO THE ROOT Cargo.toml IF MISSING
 #  10. FORMATS, UPDATES Cargo.lock, THEN FAILS ON cargo fmt --check OR A FAILED
 #      cargo build OF THE CRATE
@@ -365,8 +365,8 @@ def patch_enum_shims(dst_root):
 
 
 def patch_ops_version_suffix(dst_root):
-    """Inject the version suffix into the struct_ops name, so scx_loader shows
-    the version beside the name it reads from /sys/kernel/sched_ext/root/ops."""
+    """Inject the version suffix into the struct_ops name, so the version reads
+    beside the name in /sys/kernel/sched_ext/root/ops."""
     sched_path = os.path.join(dst_root, "src", "scheduler.rs")
     text = open(sched_path).read()
     if "ops_version_suffix" in text:
@@ -379,7 +379,7 @@ def patch_ops_version_suffix(dst_root):
     inject = anchor + (
         '\n'
         '\n'
-        '        // INJECT THE VERSION SUFFIX INTO THE OPS NAME FOR scx_loader\n'
+        '        // INJECT THE VERSION SUFFIX INTO THE OPS NAME\n'
         '        {\n'
         '            let ops = open_skel.struct_ops.panda_ops_mut();\n'
         '            let name_field = &mut ops.name;\n'
@@ -406,7 +406,7 @@ def patch_ops_version_suffix(dst_root):
         '        }'
     )
     open(sched_path, "w").write(text.replace(anchor, inject, 1))
-    log_info("patched scheduler.rs with the ops version suffix (scx_loader)")
+    log_info("patched scheduler.rs with the ops version suffix")
     return 1
 
 
