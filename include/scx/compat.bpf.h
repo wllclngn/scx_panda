@@ -47,15 +47,62 @@ void scx_bpf_dispatch_from_dsq_set_vtime___old(struct bpf_iter_scx_dsq *it__iter
 bool scx_bpf_dispatch_from_dsq___old(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
 bool scx_bpf_dispatch_vtime_from_dsq___old(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
 int bpf_cpumask_populate(struct cpumask *dst, void *src, size_t src__sz) __ksym __weak;
-#define scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags)				\
-	(bpf_ksym_exists(scx_bpf_dsq_insert) ?					\
-	 scx_bpf_dsq_insert((p), (dsq_id), (slice), (enq_flags)) :		\
-	 scx_bpf_dispatch___compat((p), (dsq_id), (slice), (enq_flags)))
 
-#define scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags)		\
-	(bpf_ksym_exists(scx_bpf_dsq_insert_vtime) ?				\
-	 scx_bpf_dsq_insert_vtime((p), (dsq_id), (slice), (vtime), (enq_flags)) : \
-	 scx_bpf_dispatch_vtime___compat((p), (dsq_id), (slice), (vtime), (enq_flags)))
+/*
+ * v6.19: scx_bpf_dsq_insert() returns bool as scx_bpf_dsq_insert___v2(), and
+ * scx_bpf_dsq_insert_vtime() packs its scalars in a struct as
+ * __scx_bpf_dsq_insert_vtime(). The kernel carries the older forms beside the
+ * newer for a while; every name here is weak, so a kernel that drops one still
+ * loads the object. Unlike upstream's header, the older form is called while
+ * the kernel carries it: Every kernel runs the kfunc earlier releases ran, the
+ * one montauk's DSQ probes hook, and the newer form takes over only where the
+ * older is gone. libbpf binds each name by what precedes its last ___. The
+ * args struct is given here under a flavour, so a vmlinux.h from before v6.19,
+ * which has no such type, still compiles; its layout is the kernel's.
+ */
+bool scx_bpf_dsq_insert___v2___compat(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
+void scx_bpf_dsq_insert___v1(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
+
+static inline void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice,
+				      u64 enq_flags)
+{
+	if (bpf_ksym_exists(scx_bpf_dsq_insert___v1))
+		scx_bpf_dsq_insert___v1(p, dsq_id, slice, enq_flags);
+	else if (bpf_ksym_exists(scx_bpf_dsq_insert___v2___compat))
+		scx_bpf_dsq_insert___v2___compat(p, dsq_id, slice, enq_flags);
+	else
+		scx_bpf_dispatch___compat(p, dsq_id, slice, enq_flags);
+}
+
+struct scx_bpf_dsq_insert_vtime_args___panda {
+	u64 dsq_id;
+	u64 slice;
+	u64 vtime;
+	u64 enq_flags;
+};
+
+bool __scx_bpf_dsq_insert_vtime___panda(struct task_struct *p,
+					struct scx_bpf_dsq_insert_vtime_args___panda *args) __ksym __weak;
+void scx_bpf_dsq_insert_vtime___v1(struct task_struct *p, u64 dsq_id, u64 slice, u64 vtime, u64 enq_flags) __ksym __weak;
+
+static inline void scx_bpf_dsq_insert_vtime(struct task_struct *p, u64 dsq_id, u64 slice,
+					    u64 vtime, u64 enq_flags)
+{
+	if (bpf_ksym_exists(scx_bpf_dsq_insert_vtime___v1)) {
+		scx_bpf_dsq_insert_vtime___v1(p, dsq_id, slice, vtime, enq_flags);
+	} else if (bpf_ksym_exists(__scx_bpf_dsq_insert_vtime___panda)) {
+		struct scx_bpf_dsq_insert_vtime_args___panda args = {
+			.dsq_id = dsq_id,
+			.slice = slice,
+			.vtime = vtime,
+			.enq_flags = enq_flags,
+		};
+
+		__scx_bpf_dsq_insert_vtime___panda(p, &args);
+	} else {
+		scx_bpf_dispatch_vtime___compat(p, dsq_id, slice, vtime, enq_flags);
+	}
+}
 
 #define scx_bpf_dsq_move_to_local(dsq_id, enq_flags)				\
 	(bpf_ksym_exists(scx_bpf_dsq_move_to_local___v2___compat) ?		\
@@ -297,6 +344,27 @@ static inline void scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
 		scx_bpf_task_set_dsq_vtime___new(p, vtime);
 	else
 		p->scx.dsq_vtime = vtime;
+}
+
+/*
+ * v6.19: scx_bpf_reenqueue_local() is void as scx_bpf_reenqueue_local___v2()
+ * and may be called from anywhere; v7.1 adds scx_bpf_dsq_reenq(), which is to
+ * replace both. This program calls it from cpu_release alone, where every form
+ * does the same, and reads no count. As for the inserts, the oldest form is
+ * called while the kernel carries it, and none of the three is a hard symbol.
+ */
+u32 scx_bpf_reenqueue_local___v1(void) __ksym __weak;
+void scx_bpf_reenqueue_local___v2___compat(void) __ksym __weak;
+void scx_bpf_dsq_reenq___compat(u64 dsq_id, u64 reenq_flags) __ksym __weak;
+
+static inline void scx_bpf_reenqueue_local(void)
+{
+	if (bpf_ksym_exists(scx_bpf_reenqueue_local___v1))
+		scx_bpf_reenqueue_local___v1();
+	else if (bpf_ksym_exists(scx_bpf_reenqueue_local___v2___compat))
+		scx_bpf_reenqueue_local___v2___compat();
+	else
+		scx_bpf_dsq_reenq___compat(SCX_DSQ_LOCAL, 0);
 }
 
 /*

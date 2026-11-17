@@ -79,9 +79,8 @@ values it is given always describe one kernel.
 
 Running it by hand instead: `scx_panda` attaches and runs, `scx_panda -v`
 prints a counter line every second, `scx_panda --version` names the build.
-When it exits it prints a summary and writes the same under
-`/tmp/panda/summary-<time>.txt`; if the kernel ever ejects it, the kernel's
-dump of every queue lands under `/tmp/panda/dump-<time>.txt`.
+When it exits it prints a summary; if the kernel ever ejects it, the kernel's
+dump of every queue lands under `/run/scx_panda/dump-<time>.txt`.
 
 ## Test
 
@@ -90,17 +89,20 @@ PANDEMONIUM in the sibling directory (`PANDEMONIUM_DIR` points elsewhere if
 needed):
 
 ```
-./panda.py prism --dev frame --iterations 5
+./panda.py prism --dev media --iterations 5
 ```
 
-That runs the frame bench, a stand-in for a game's threads (a simulation
-thread fanning jobs out to workers, a render and submit chain, audio and
-input threads, with and without background load) with scx_panda as the
-scheduler under test. `prism` passes its arguments through and asks for sudo
-itself.
+That runs the media bench with scx_panda as the scheduler under test: A
+stand-in for a game's threads (a simulation thread fanning jobs out to
+workers, a render and submit chain, audio and input threads, with and without
+background load) beside a silent PipeWire stream. It reports the frame rate
+and its lows, and the audio cycles the stream and its driver missed, which
+montauk 8.16.0 or later reads from PipeWire itself. `-- --fps` after the
+arguments runs the frames alone. `prism` passes its arguments through and
+asks for sudo itself.
 
 A change to the scheduler is never judged by eye. The tree's program is
-built, installed and run on the frame bench and the scale bench:
+built, installed and run on the media bench and the scale bench:
 
 ```
 ./panda.py measure --iterations 3

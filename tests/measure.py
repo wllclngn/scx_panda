@@ -5,19 +5,19 @@
 measure: the bench driver for this tree's scx_panda.
 
 Builds and installs the tree's program once, runs PANDEMONIUM's prism benches on
-it alone (scale and frame by default), folds the seat-price counters it wrote
-under /tmp/panda and prints every report's tables side by side. --control adds
-PANDEMONIUM's own two arms from the same evening.
+it alone (scale and media by default) and prints every report's tables side by
+side. --control adds PANDEMONIUM's own two arms from the same evening.
 
 Usage:
-    ./tests/measure.py [--benches scale,frame] [--cores 8,12] [--iterations 1]
+    ./tests/measure.py [--benches scale,media] [--cores 8,12] [--iterations 1]
                        [--scale-iterations 1] [--prism-args="FLAGS"]
                        [--child-args="FLAGS"] [--control] [--dry-run]
     ./tests/measure.py --read REPORT [REPORT ...]
 
---cores applies to scale; frame runs at native width. --child-args reaches
+--cores applies to scale; media runs at native width. --child-args reaches
 the bench itself, so one cell runs alone: --child-args="--scenarios contended"
-for frame, --child-args="--cells ipc" for scale (any of latency, compile,
+for media (--child-args="--fps" runs its frames with no audio stream),
+--child-args="--cells ipc" for scale (any of latency, compile,
 burst, longrun, mixed, deadline, ipc and launch, comma-separated).
 --prism-args reaches prism: --prism-args="--trace" records montauk captures.
 Both take their value after an = sign, since the value starts with a dash.
@@ -39,8 +39,7 @@ PANDEMONIUM_DIR = Path(os.environ.get("PANDEMONIUM_DIR", PANDA_DIR.parent / "PAN
 # UNDER sudo THE HARNESS WRITES ITS REPORTS TO THE INVOKING USER'S CACHE.
 _HOME = Path(os.path.expanduser(f"~{os.environ['SUDO_USER']}")) if os.environ.get("SUDO_USER") else Path.home()
 REPORT_DIR = _HOME / ".cache" / "pandemonium"
-SUMMARY_DIR = Path("/tmp/panda")
-BENCHES = ("scale", "frame")
+BENCHES = ("scale", "media")
 
 SCALE_METRICS = [
     ("compile_s", "compile s"),
@@ -57,7 +56,7 @@ SCALE_METRICS = [
     ("launch_p99", "launch p99 us"),
 ]
 
-FRAME_METRICS = [
+MEDIA_METRICS = [
     ("AVG FPS", "avg fps"),
     ("1% LOW FPS (p99)", "1% low fps"),
     ("1% LOW FPS (avg)", "1% low fps (avg)"),
@@ -70,6 +69,8 @@ FRAME_METRICS = [
     ("JOB WAKE p99 us", "job wake p99 us"),
     ("JOB WAKE p99.9 us", "job wake p99.9 us"),
     ("AUDIO LATE p99 us", "audio late p99 us"),
+    ("AUDIO MISSED (STREAM)", "audio missed (stream)"),
+    ("AUDIO MISSED (DRIVER)", "audio missed (driver)"),
 ]
 
 
@@ -184,10 +185,10 @@ def parse_scale(path: Path) -> dict:
     return out
 
 
-# FRAME REPORTS
+# MEDIA REPORTS
 
-def parse_frame(path: Path) -> dict:
-    """{scenario: {scheduler: {metric: mean}}} from one prism-frame report. A
+def parse_media(path: Path) -> dict:
+    """{scenario: {scheduler: {metric: mean}}} from one prism-media report. A
     row is a metric label and one "mean ±sd" cell per scheduler column."""
     out: dict = {}
     scen = None
@@ -225,7 +226,7 @@ def parse_frame(path: Path) -> dict:
 
 def print_tables(kind: str, results: list[tuple[str, dict]]) -> None:
     """results: [(label, parsed)]; one table per width or scenario."""
-    metrics = SCALE_METRICS if kind == "scale" else FRAME_METRICS
+    metrics = SCALE_METRICS if kind == "scale" else MEDIA_METRICS
     keys = sorted({k for _, r in results for k in r}, key=str)
     for k in keys:
         cols = []
@@ -242,24 +243,6 @@ def print_tables(kind: str, results: list[tuple[str, dict]]) -> None:
             if all(v is None for v in vals):
                 continue
             print(f"{title:<24}" + "".join(f"{'' if v is None else f'{v:g}':>36}" for v in vals))
-
-
-def read_summaries(since: float) -> tuple[int, int, int]:
-    """(files, expect_used, expect_overrun) over the summaries written since."""
-    files = used = over = 0
-    for p in SUMMARY_DIR.glob("summary-*.txt"):
-        try:
-            if p.stat().st_mtime < since:
-                continue
-            text = p.read_text()
-        except OSError:
-            continue
-        files += 1
-        m = re.search(r"expect_used=(\d+) expect_overrun=(\d+)", text)
-        if m:
-            used += int(m.group(1))
-            over += int(m.group(2))
-    return files, used, over
 
 
 def newest_report(bench_name: str, since: float) -> Path | None:
@@ -303,15 +286,15 @@ def bench(name: str, extra: list[str], cores: str, iterations: int, dry: bool,
 
 
 def parse(name: str, path: Path) -> dict:
-    return parse_scale(path) if name == "scale" else parse_frame(path)
+    return parse_scale(path) if name == "scale" else parse_media(path)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--benches", default=",".join(BENCHES),
-                    help="comma-separated: scale, frame (default both)")
+                    help="comma-separated: scale, media (default both)")
     ap.add_argument("--cores", default="8,12", help="scale widths (default 8,12)")
-    ap.add_argument("--iterations", type=int, default=1, help="frame iterations (default 1)")
+    ap.add_argument("--iterations", type=int, default=1, help="media iterations (default 1)")
     ap.add_argument("--scale-iterations", type=int, default=1,
                     help="scale iterations; scale is the saturation guard (default 1)")
     ap.add_argument("--prism-args", default="", metavar="FLAGS",
@@ -319,13 +302,13 @@ def main() -> int:
                          "e.g. --prism-args=\"--trace\"")
     ap.add_argument("--child-args", default="", metavar="FLAGS",
                     help="flags for the bench child itself, written with =, e.g. "
-                         "--child-args=\"--scenarios contended\" for frame or "
+                         "--child-args=\"--scenarios contended\" for media or "
                          "--child-args=\"--cells ipc\" for scale")
     ap.add_argument("--control", action="store_true",
                     help="also run PANDEMONIUM's two arms (prism --pandemonium-only)")
     ap.add_argument("--dry-run", action="store_true", help="print the commands only")
     ap.add_argument("--read", nargs="+", metavar="REPORT",
-                    help="print the tables of existing prism-scale or prism-frame reports and exit")
+                    help="print the tables of existing prism-scale or prism-media reports and exit")
     args = ap.parse_args()
 
     if args.read:
@@ -353,7 +336,6 @@ def main() -> int:
     if not install(args.dry_run):
         log("ERROR", "scx_panda: install failed")
         return 1
-    since = time.time()
     for b in benches:
         iters = args.scale_iterations if b == "scale" else args.iterations
         log("INFO", f"scx_panda: prism {b}, {iters} iteration(s)"
@@ -366,10 +348,6 @@ def main() -> int:
             continue
         results[b].append(("", parse(b, rep)))
         reports.append((f"scx_panda {b}", rep))
-    files, used, over = read_summaries(since)
-    share = f"{100 * over / (used + over):.0f}%" if used + over else "n/a"
-    log("INFO", f"scx_panda: {files} summaries, expect_used {used}, "
-                f"expect_overrun {over} (overrun share {share})")
     if args.control:
         for b in benches:
             log("INFO", f"control: PANDEMONIUM's two arms on {b}")

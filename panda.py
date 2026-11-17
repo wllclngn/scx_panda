@@ -28,13 +28,18 @@ Usage:
     ./panda.py rebuild            Clean the package artifacts and build again
     ./panda.py prism ARGS...      Run PANDEMONIUM's prism with scx_panda as the
                                     arm (--only scx_panda unless ARGS name the
-                                    field), e.g. prism --dev frame --iterations 5;
+                                    field), e.g. prism --dev media --iterations 5;
                                     refuses while another bench runs, and
                                     restarts the service after if it was active
     ./panda.py measure ARGS...    Build and install this tree's program, run
                                     PANDEMONIUM's prism benches on it alone and
                                     print the reports' tables (tests/measure.py),
-                                    e.g. measure --benches frame --iterations 1
+                                    e.g. measure --benches media --iterations 1
+    ./panda.py deck ARGS...       Switch the Steam Deck over SSH between stock,
+                                    Valve's scx_lavd and the staged scx_panda in
+                                    timed segments while the player plays the
+                                    running game, blind by default
+                                    (tests/deck.py), e.g. deck --segment 120
 """
 
 import json
@@ -64,6 +69,7 @@ OPS_NAME = "scx_panda"
 CAPS = "cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_nice+ep"
 PANDEMONIUM_DIR = Path(os.environ.get("PANDEMONIUM_DIR", SCRIPT_DIR.parent / "PANDEMONIUM"))
 MEASURE = SCRIPT_DIR / "tests" / "measure.py"
+DECK = SCRIPT_DIR / "tests" / "deck.py"
 BENCH_PATTERNS = ("tests/prism", "pandemonium-tests.py", "tests/measure.py", "framebench")
 # scx's CATALOG RULES FOR A CUSTOM PROFILE, AS PANDEMONIUM HOLDS ITS OWN TO.
 SCX_PROFILES = SCRIPT_DIR / "catalog" / "profiles.json"
@@ -563,7 +569,7 @@ def cmd_prism(args: list[str]) -> int:
         log_error(f"PANDEMONIUM not found at {PANDEMONIUM_DIR} (set PANDEMONIUM_DIR)")
         return 2
     if not args:
-        log_error("prism needs its arguments, e.g. ./panda.py prism --dev frame --iterations 5")
+        log_error("prism needs its arguments, e.g. ./panda.py prism --dev media --iterations 5")
         return 2
     # WHAT FOLLOWS A BARE `--` IS THE BENCH'S OWN; prism's FLAGS END THERE. THE
     # INSTALLED scx_panda IS THE FIELD UNLESS prism IS TOLD ONE: --arm NAMES
@@ -719,6 +725,9 @@ def main() -> int:
     if sys.argv[1] in ("prism", "measure"):
         log_info(f"{NAME} v{version()}: {sys.argv[1]} SELECTED")
         return cmd_prism(args) if sys.argv[1] == "prism" else cmd_measure(args)
+    # THE DECK IS ANOTHER MACHINE: NO LOCAL BENCH GUARD, NO SERVICE DANCE HERE.
+    if sys.argv[1] == "deck":
+        return subprocess.run([sys.executable, str(DECK), *args], cwd=SCRIPT_DIR).returncode
     cmd, flags = sys.argv[1], set(args)
     if "--seafoam-labs" in flags:
         if cmd != "install" or flags - {"--seafoam-labs"}:

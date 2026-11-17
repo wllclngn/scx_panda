@@ -20,9 +20,11 @@ use crate::scheduler::Scheduler;
 //
 // CARVE-OUT: ONLY ABSOLUTE-COUNT QUANTITIES KEEP nr_cpu_ids. GRAPH-SHAPE
 // QUANTITIES, SEARCH BUDGETS INCLUDED, GO THROUGH tau VIA
-// lambda_2 = TAU_SCALE_NS / tau. TWO SITES IN main.bpf.c KEEP nr_cpu_ids:
-//   select_cpu()'s wake_wide THRESHOLD, WHICH MATCHES A KERNEL CONVENTION
-//   tick()'s ROTATING-SCAN BUDGET, WHICH IS COVERAGE, NOT GRAPH SHAPE
+// lambda_2 = TAU_SCALE_NS / tau. WHAT KEEPS nr_cpu_ids IN main.bpf.c IS
+// COVERAGE, NOT GRAPH SHAPE:
+//   tick()'s ROTATING SCAN AND THE SWEEP'S WINDOWS, WHICH MUST REACH EVERY CPU
+//   THE STEAL OF A CPU ABOUT TO IDLE, WHICH WALKS ITS WHOLE ROW
+//   THE BUDGETS' CEILING, A ROW'S LENGTH
 //
 // EXTRACTION IS O(n log n) ON TOP OF THE EXISTING O(n^3) JACOBI.
 // REFERENCE: CHEEGER'S INEQUALITY BOUNDS lambda_2 AGAINST GRAPH BOTTLENECK.
@@ -66,19 +68,23 @@ pub struct TopologySpectrum {
     pub tau_ns: u64,             // clamped TAU_SCALE_NS / sqrt(fiedler * N)
     pub codel_eq_ns: u64,        // A POSITION IN THE BAND codel_window() GIVES,
                                  // SET BY THE SPECTRAL-GAP DEFICIT. NO CLAMP.
-    // Phi migration-potential distance->wait scale (Q16). The extra head-wait a
-    // steal must clear before crossing to a peer = (reff * this) >> 16 ns. Always
-    // computed now (T1): the continuous metric prices distance on every part, no
-    // binary topology gate -- on a monolithic part it calibrates to the L2 seam.
+    // Phi migration-potential distance->wait scale (Q16): reff_value holds
+    // (reff * this) >> 16 ns for each ranked peer, and requeue_kick_flag adds
+    // the target's slot 0 to an owed requeue's threshold. Computed on every
+    // part, with no binary topology gate -- on a monolithic part it calibrates
+    // to the L2 seam.
     pub phi_dist_scale_q16: u64,
 }
 
 // T2: the emergent domain tree. Leaves are tightly-coupled CPU sets (an L2 group
 // / core -- nothing meaningful to partition below); internal nodes are a
-// min-conductance cut carrying its phi, the price to cross that seam. T3's
-// bounded-local steal climbs this tree: drain your leaf, then your subtree,
-// crossing a cut only when its phi says the imbalance pays. The discrete cache domain
-// enum is gone -- this structure emerges from the cache graph, per machine.
+// min-conductance cut carrying its phi, the price to cross that seam. The tree
+// gives the BPF side two tables: the domain map (domain_partition), which keeps
+// the spill's and the spent seat's walks inside a domain and counts
+// cross-domain landings, and each ranked pair's crossing price
+// (domain_cross_phi_matrix), which prices the steal's pair-split hold. The
+// steal itself walks the R_eff rank. The discrete cache domain enum is gone --
+// this structure emerges from the cache graph, per machine.
 #[derive(Debug, Clone)]
 pub enum DomainNode {
     Leaf(Vec<usize>),
@@ -103,7 +109,7 @@ impl DomainNode {
     }
 
     // Every cut's phi -- the crossing-price ladder (coarser seams cost less, so
-    // phi rises with depth as the steal climbs toward more tightly-coupled work).
+    // phi rises with depth toward more tightly-coupled work).
     pub fn cut_phis(&self) -> Vec<f64> {
         match self {
             DomainNode::Leaf(_) => Vec::new(),
@@ -443,7 +449,7 @@ impl CpuTopology {
     //   R_eff(i,j) = L+[i,i] + L+[j,j] - 2*L+[i,j]
     //
     // EDGE CONDUCTANCES, THE INVERSE OF RESISTANCE:
-    //   L2 SIBLINGS          10.0   SHARED L2, NEAR-ZERO MIGRATION COST
+    //   L2 SIBLINGS          1000.0 SHARED L2, NEAR-ZERO MIGRATION COST
     //   SAME L3              3.0    SHARED LLC
     //   CROSS-DOMAIN SOCKET  1.0    INTERCONNECT HOP, ~8x CORE-TO-CORE LATENCY
     //   CROSS-SOCKET         0.3    NUMA HOP
@@ -464,8 +470,9 @@ impl CpuTopology {
     // Make the edge very stiff -> R_eff(SMT-sib) ~ 0, which lands the Phi migration
     // barrier exactly at the physical-core / L2 boundary (a real cold-L2 refill)
     // instead of penalizing free intra-core moves. lambda_2 is the cross-domain Fiedler
-    // cut (independent of L2 stiffness) so tau is unchanged, and codel_eq is already
-    // clamped at its ceiling, so the oscillator timescales are invariant.
+    // cut (independent of L2 stiffness) so tau is unchanged. codel_eq is not: the
+    // stiff edges' eigenvalues shrink Tr(L+), which places c_eq higher in the
+    // band (s ~0.72 on an SMT part; see compute_codel_eq_ns).
     const CONDUCTANCE_L2: f64 = 1000.0;   // L2 / SMT SIBLINGS
     const CONDUCTANCE_LLC: f64 = 3.0;     // SAME L3 (ABOVE SOCKET; always-on rung)
     const CONDUCTANCE_SOCKET: f64 = 1.0;  // SAME SOCKET, CROSS-DOMAIN (IF HOP) -- OR MONOLITHIC SAME-SOCKET
@@ -484,18 +491,6 @@ impl CpuTopology {
     const ICOND_CROSS: i128 = 3;
     const ICOND_RECOVER: f64 = 10.0; // undo the x10 conductance scale
     const REFF_EXACT_MAX_CPUS: usize = 24;
-
-    // SPILL-Phi PLACEMENT DEPTH THRESHOLDS. RUST FOLDS R_eff INTO A PER-PEER
-    // DSQ-DEPTH CAP THE BPF SPILL HELPER APPLIES: NEAR PEERS (R_eff~0) ACCEPT
-    // SPILLS UP TO SPILL_NEAR_DEPTH, THE MOST DISTANT ONLY WHEN NEAR-EMPTY
-    // (SPILL_FAR_DEPTH). MONOLITHIC (NO DISTANCE STRUCTURE TO PRICE) -> FLAT
-    // SPILL_MONO_DEPTH.
-    // FAR_DEPTH=1 IS THE SHIPPED SETTING: THE STRICT FORM -- A FAR PEER TAKES
-    // A SPILL ONLY WHEN EMPTY. MEASURED ON IT: LOCALITY 77.9% CACHE-LOCAL AT
-    // 86k MIGRATIONS/s, LONGRUN p99 0.58x VS THE ARCHIVED PEAK, ipc NEUTRAL;
-    // AN UNPROVEN BURST/MIXED DRIFT (~1.2x, p >= 0.67 AT N=2) IS TRACKED,
-    // WITH A FAR_DEPTH=2 A/B QUEUED IN ROADMAP.md. CHANGE THIS VALUE ONLY
-    // WITH THAT A/B IN HAND.
 
     // BUILD WEIGHTED GRAPH LAPLACIAN FROM CPU TOPOLOGY
     // Conductance edge weight between two CPUs, derived from the cache hierarchy.
@@ -805,15 +800,14 @@ impl CpuTopology {
     }
 
     // Compute the emergent domain tree over all online CPUs -- the de-facto-NUMA
-    // hierarchy from which T3's bounded-local steal reads its locality clusters
-    // and per-cut crossing prices. Public: the T2 -> T3 hand-off point.
+    // hierarchy the domain map and the per-pair crossing prices are read from.
     pub fn compute_domain_tree(&self) -> DomainNode {
         self.build_domain_tree(&self.online)
     }
 
-    // Log the emergent domains at boot -- observability that the tree the steal
-    // will climb matches the silicon: atomic-domain count, cut depth, the
-    // crossing-price (phi) range, and the first leaves.
+    // Log the emergent domains at boot -- observability that the tree matches
+    // the silicon: atomic-domain count, cut depth, the crossing-price (phi)
+    // range, and the first leaves.
     pub fn log_domains(&self, tree: &DomainNode) {
         let leaves = tree.leaves();
         let phis = tree.cut_phis();
@@ -831,12 +825,13 @@ impl CpuTopology {
         log_info!("EMERGENT DOMAINS: leaves {}", preview.join(" "));
     }
 
-    // T3b.1: the per-CPU-pair crossing-price matrix the bounded steal reads.
-    // m[i*n + j] = (phi * 1e6) of the LCA cut separating CPU i and CPU j -- the
-    // price to steal across that emergent domain boundary. A LOW phi is a loose
-    // seam (a major boundary -- socket / cross-L3 -- far, needs more imbalance to
-    // cross); a HIGH phi is a tight seam (near). Same-leaf pairs share NO cut:
-    // sentinel u32::MAX = maximally local, the steal never has to "cross" for them.
+    // T3b.1: the per-CPU-pair crossing-price matrix the steal's pair-split hold
+    // reads. m[i*n + j] = (phi * 1e6) of the LCA cut separating CPU i and CPU j.
+    // A LOW phi is a loose seam (a major boundary -- socket / cross-L3 -- far);
+    // a HIGH phi is a tight seam (near). The hold waits up to one target to
+    // split a pair across a tight seam and about none across a loose one, which
+    // the distance already prices. Same-leaf pairs share NO cut: sentinel
+    // u32::MAX, no hold.
     // Replaces the discrete domain map's discrete same/different-cache domain test with a continuous,
     // emergent boundary price (THE FLAG: priced, not gated).
     pub fn domain_cross_phi_matrix(&self, tree: &DomainNode) -> Vec<u32> {
@@ -1369,13 +1364,12 @@ impl CpuTopology {
         }
         let rank = self.build_affinity_rank(&reff);
         // DISTANCE SCALE: calibrated so the most distant pair (max R_eff)
-        // maps to ~tau of required steal-wait, an SMT sibling (R_eff ~ 0) to ~0. Only
-        // sustained backlog (~tau) justifies a far move; a single queued slice does
-        // not. reff_norm uses the same 1e6 scale the BPF reff_value map stores.
+        // maps to ~tau, an SMT sibling (R_eff ~ 0) to ~0, before reff_value's
+        // cap of 2 * codel_eq_ns. reff_norm uses the same 1e6 scale the BPF
+        // reff_value map stores.
         // ALWAYS computed: on a single-L3 part the most distant pair is the cross-L2
-        // (cross-core) max, so reff_norm auto-calibrates the brake to the L2 boundary
-        // instead of vanishing -- the continuous metric drives placement on EVERY
-        // processor, with no binary topology gate in front of it (THE FLAG).
+        // (cross-core) max, so reff_norm calibrates to the L2 boundary instead of
+        // vanishing, with no binary topology gate in front of it (THE FLAG).
         let max_reff = reff.iter().cloned().fold(0.0f64, f64::max);
         let reff_norm = ((max_reff * 1_000_000.0).round() as u64).max(1);
         let phi_dist_scale_q16 = tau_ns.saturating_mul(65536) / reff_norm;
@@ -1385,7 +1379,7 @@ impl CpuTopology {
     // THE FOUR TABLES THE BPF WALKS READ, EACH nr_cpus * MAX_AFFINITY_CANDIDATES
     // AND PAIRED 1:1 ON cpu * MAX_AFFINITY_CANDIDATES + slot:
     //   rank   THE TARGET CPU, R_eff ASCENDING
-    //   value  THE STEAL'S DISTANCE PENALTY TO IT, NS
+    //   value  ITS DISTANCE PENALTY, NS (requeue_kick_flag READS SLOT 0)
     //   frac   R_eff TO IT AS A Q16 FRACTION OF THE MACHINE'S SPAN
     //   phi    THE EMERGENT-DOMAIN CROSSING PRICE TO IT
     // A ROW HOLDS ITS CPU'S ONLINE PEERS, CAPPED AT THE TABLE'S WIDTH, AND THEN
@@ -1435,27 +1429,25 @@ impl CpuTopology {
                 t.rank[at] = val;
                 // T3b.1: the emergent-domain crossing price to this ranked peer,
                 // 1:1 with the rank slot.
-                // IF phi_dist_scale_q16 IS 0 (tau UNSET; ITS FLOOR PREVENTS IT) THE STEAL
-                // DOES NO R_eff DISTANCE PRICING; MAKE THE CROSSING PRICE
-                // SENTINEL TOO SO THE STEAL-SIDE PAIR-SPLIT HOLD IS A NO-OP,
-                // MATCHING reff_value's FLAT codel_target BASELINE (THE STEAL
-                // IS domain_phi's CONSUMER).
+                // IF phi_dist_scale_q16 IS 0 (tau UNSET; ITS FLOOR PREVENTS IT) NO
+                // TABLE PRICES DISTANCE: reff_value AND reff_frac ARE ZERO, AND THE
+                // CROSSING PRICE STAYS SENTINEL SO THE STEAL'S PAIR-SPLIT HOLD,
+                // domain_phi's ONE CONSUMER, IS A NO-OP.
                 if phi_dist_scale_q16 != 0 {
                     t.phi[at] = domain_phi[cpu * n + val as usize];
                 }
                 // FOLD THE PHI DISTANCE PENALTY AT INIT: reff_value stores the
-                // final steal extra-wait in ns, (R_eff * phi_dist_scale_q16) >> 16,
-                // so the BPF steal does one indexed read and no multiply. The 1e6
-                // scale matches build_affinity_rank's sort key. phi_dist_scale_q16
-                // is computed on every part, a single-L3 one included; 0 only with tau unset -> flat
-                // codel_target (exact prior behavior).
-                // CEILING-ONLY CLAMP (shipped with SPILL-Phi; deliberately no
-                // floor): an unclamped toll scales toward tau itself (~40ms,
-                // the magnitude behind three hard freezes in the postmortem
-                // record); cap it at 2*codel_eq_ns. NO floor -- dist_extra is a
-                // per-peer price that must reach ~0 for a genuinely near peer (an
-                // SMT sibling stays freely relievable), and STEP 1's phi_thresh
-                // already adds the uniform codel_target_ns base on top.
+                // extra wait in ns, (R_eff * phi_dist_scale_q16) >> 16, so its BPF
+                // reader, requeue_kick_flag, does one indexed read and no multiply.
+                // The 1e6 scale matches build_affinity_rank's sort key.
+                // phi_dist_scale_q16 is computed on every part, a single-L3 one
+                // included; 0 only with tau unset -> flat codel_target.
+                // CEILING-ONLY CLAMP (deliberately no floor): an unclamped toll
+                // scales toward tau itself (~40ms, the magnitude behind three hard
+                // freezes in the postmortem record); cap it at 2*codel_eq_ns. NO
+                // floor -- the penalty must reach ~0 for a genuinely near peer, and
+                // requeue_kick_flag already adds the uniform codel_target_ns base
+                // on top.
                 let r_scaled = to_scaled(reff[cpu * n + val as usize]);
                 let raw_extra = r_scaled.saturating_mul(phi_dist_scale_q16) >> 16;
                 t.value[at] = if phi_dist_scale_q16 == 0 {
@@ -1466,11 +1458,10 @@ impl CpuTopology {
                         .min(u32::MAX as u64) as u32
                 };
                 // THE SAME R_eff SHAPE, WITH NO TIME UNIT ON IT. reff_value folds
-                // the distance against TAU because that is the steal's question:
-                // only sustained backlog (~tau) justifies a far pull. The wake-path
-                // placement sites ask a different question against a comparand two
-                // orders smaller -- one codel_target (233-667us) -- so the tau fold
-                // is 20-170x oversized there and settles those tests by itself.
+                // the distance against TAU. The steal and the wake-path placement
+                // sites compare against one codel_target (233-667us), two orders
+                // smaller, so the tau fold would be 20-170x oversized there and
+                // settle those tests by itself.
                 // Emit the fraction instead and let each consumer multiply by the
                 // yardstick its own comparison uses. Q16, so 65536 == the most
                 // distant pair on this machine; bounded at every topology, which is

@@ -7,7 +7,11 @@
 // SIZES AND FILLS ITS TOPOLOGY TABLES FROM SYSFS, ATTACHES IT, RE-FILLS ON
 // HOTPLUG, PRINTS COUNTERS WHEN ASKED AND RESTARTS WHEN THE KERNEL ASKS.
 
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::Write;
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -21,9 +25,9 @@ use scx_panda::{log_info, log_warn};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// WHERE AN EXIT DUMP AND THE EXIT SUMMARY ARE WRITTEN WHOLE. A HARNESS THAT
-// STARTS THIS BINARY AS AN ARM MAY DISCARD ITS STDOUT; THE FILES REMAIN.
-const DUMP_DIR: &str = "/tmp/panda";
+// WHERE AN EXIT DUMP IS WRITTEN WHOLE. A HARNESS THAT STARTS THIS BINARY AS
+// AN ARM MAY DISCARD ITS STDOUT; THE FILES REMAIN.
+const DUMP_DIR: &str = "/run/scx_panda";
 const DUMP_HEAD_LINES: usize = 60;
 
 #[derive(Parser)]
@@ -215,7 +219,6 @@ fn print_summary(s: &PandaStats, ev: Option<&ScxEvents>) {
     for line in &lines {
         println!("{line}");
     }
-    write_summary(&lines);
 }
 
 fn epoch_secs() -> u64 {
@@ -225,34 +228,18 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-// THE SUMMARY UNDER /tmp/panda, HEADED BY THE VERSION.
-fn write_summary(lines: &[String]) {
-    let path = format!("{DUMP_DIR}/summary-{}.txt", epoch_secs());
-    let mut body = format!(
-        "scx_panda {}{} kernel {}\n",
-        env!("CARGO_PKG_VERSION"),
-        env!("PANDA_BUILD_ID"),
-        env!("PANDA_KERNEL")
-    );
-    body.push_str(&lines.join("\n"));
-    body.push('\n');
-    match std::fs::create_dir_all(DUMP_DIR).and_then(|_| std::fs::write(&path, body)) {
-        Ok(()) => log_info!("summary written to {}", path),
-        Err(e) => log_warn!("summary not written to {}: {}", path, e),
-    }
-}
-
-// THE KERNEL'S EXIT DUMP: WHOLE TO A FILE UNDER /tmp/panda, ITS HEAD TO THE
-// JOURNAL. AN EMPTY DUMP IS SAID SO.
+// THE KERNEL'S EXIT DUMP: WHOLE TO A FILE UNDER /run/scx_panda, ITS HEAD TO
+// THE JOURNAL. AN EMPTY DUMP IS SAID SO.
 fn write_dump(dump: &str) {
     if dump.trim().is_empty() {
         log_warn!("BPF exit dump: empty");
         return;
     }
     let lines: Vec<&str> = dump.lines().collect();
-    let path = format!("{DUMP_DIR}/dump-{}.txt", epoch_secs());
-    let written = std::fs::create_dir_all(DUMP_DIR)
-        .and_then(|_| std::fs::write(&path, dump))
+    let name = format!("dump-{}.txt", epoch_secs());
+    let path = format!("{DUMP_DIR}/{name}");
+    let written = create_dump_file(&name)
+        .and_then(|mut f| f.write_all(dump.as_bytes()))
         .is_ok();
     if written {
         log_warn!("BPF exit dump: {} lines written to {}", lines.len(), path);
@@ -265,4 +252,25 @@ fn write_dump(dump: &str) {
     if lines.len() > DUMP_HEAD_LINES {
         println!("[DUMP] ... {} more lines in {}", lines.len() - DUMP_HEAD_LINES, path);
     }
+}
+
+// ROOT WRITES THE DUMP, SO NO LINK IS FOLLOWED TO IT: THE DIRECTORY IS MADE
+// 0700 AND OPENED WITHOUT FOLLOWING ONE, AND THE FILE IS CREATED NEW INSIDE IT
+// AT 0600, NEVER OPENED WHERE A FILE OF THAT NAME ALREADY STANDS. THE FILE IS
+// NAMED THROUGH THE OPENED DIRECTORY'S /proc/self/fd ENTRY, AS openat NAMES IT.
+fn create_dump_file(name: &str) -> std::io::Result<File> {
+    match DirBuilder::new().mode(0o700).create(DUMP_DIR) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(DUMP_DIR)?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(format!("/proc/self/fd/{}/{name}", dir.as_raw_fd()))
 }
